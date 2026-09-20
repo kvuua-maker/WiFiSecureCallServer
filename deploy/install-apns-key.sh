@@ -13,5 +13,10 @@ env_file="$root/config/server.env"
 sed -i "s/^APNS_ENABLED=.*/APNS_ENABLED=true/" "$env_file"
 sed -i "s/^APNS_KEY_ID=.*/APNS_KEY_ID=$key_id/" "$env_file"
 systemctl restart wifi-secure-call.service
-curl --fail --silent http://127.0.0.1:8790/v1/health | grep -q '"apnsConfigured":true'
-
+for _ in {1..10}; do
+  if curl --fail --silent http://127.0.0.1:8790/v1/health | grep -q '"apnsConfigured":true'; then
+    exit 0
+  fi
+  sleep 0.5
+done
+exit 1
