@@ -95,6 +95,30 @@ func TestDeviceRegistrationAndAuth(t *testing.T) {
 	}
 	bad.Body.Close()
 }
+func TestNotificationDiagnosticsAuthAndValidation(t *testing.T) {
+	srv, _, _ := fixture(t)
+	defer srv.Close()
+	body := map[string]any{
+		"requestID":   "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+		"role":        "B",
+		"platform":    "iOS",
+		"event":       "notification_permission",
+		"status":      "authorized",
+		"tokenPrefix": "",
+		"tokenLength": 0,
+	}
+	resp := request(t, srv.URL, "POST", "/v1/devices/diagnostics", tokenB, body)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatal(resp.StatusCode)
+	}
+	resp.Body.Close()
+	body["role"] = "A"
+	bad := request(t, srv.URL, "POST", "/v1/devices/diagnostics", tokenB, body)
+	if bad.StatusCode != http.StatusBadRequest {
+		t.Fatal(bad.StatusCode)
+	}
+	bad.Body.Close()
+}
 func TestCreateAndIdempotentCreate(t *testing.T) {
 	srv, _, _ := fixture(t)
 	defer srv.Close()

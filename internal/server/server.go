@@ -31,6 +31,7 @@ func New(tokenA, tokenB string, callStore *calls.Store, deviceStore *devices.Sto
 	s.mux = http.NewServeMux()
 	s.mux.HandleFunc("GET /v1/health", s.health)
 	s.mux.HandleFunc("POST /v1/devices/register", s.auth(s.register))
+	s.mux.HandleFunc("POST /v1/devices/diagnostics", s.auth(s.notificationDiagnostics))
 	s.mux.HandleFunc("POST /v1/calls", s.auth(s.create))
 	s.mux.HandleFunc("GET /v1/calls/{id}", s.auth(s.get))
 	s.mux.HandleFunc("POST /v1/calls/{id}/{action}", s.auth(s.mutate))
@@ -43,6 +44,11 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 }
 
 type registerRequest struct{ RequestID, Role, Token, Platform string }
+
+type notificationDiagnosticRequest struct {
+	RequestID, Role, Platform, Event, Status, TokenPrefix string
+	TokenLength                                           int
+}
 
 func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	role := roleFrom(r.Context())
@@ -63,6 +69,23 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *Server) notificationDiagnostics(w http.ResponseWriter, r *http.Request) {
+	role := roleFrom(r.Context())
+	var body notificationDiagnosticRequest
+	allowedEvents := map[string]bool{
+		"notification_permission":     true,
+		"apns_registration_started":   true,
+		"apns_registration_succeeded": true,
+		"apns_registration_failed":    true,
+	}
+	if decode(r, &body) != nil || !validID(body.RequestID) || body.Role != role || !allowedEvents[body.Event] || len(body.Status) > 128 || len(body.TokenPrefix) > 8 || body.TokenLength < 0 || body.TokenLength > 512 {
+		writeError(w, http.StatusBadRequest, "invalid diagnostics")
+		return
+	}
+	slog.Info("notification registration diagnostic", "role", role, "platform", body.Platform, "event", body.Event, "status", body.Status, "tokenPrefix", body.TokenPrefix, "tokenLength", body.TokenLength)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 type createRequest struct {
 	RequestID string `json:"requestID"`
 	CallID    string `json:"callID"`
@@ -79,7 +102,13 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
+	slog.Info("call created", "callID", view.CallID, "caller", view.Caller, "callee", view.Callee, "state", view.State)
 	if device, ok := s.devices.Get(view.Callee); ok {
+		prefix := device.Token
+		if len(prefix) > 8 {
+			prefix = prefix[:8]
+		}
+		slog.Info("APNs delivery attempted", "callID", view.CallID, "role", view.Callee, "platform", device.Platform, "tokenPrefix", prefix, "tokenLength", len(device.Token))
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 			defer cancel()
