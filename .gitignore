@@ -1,0 +1,9 @@
+*.p8
+.env
+secrets/
+state/
+bin/
+wifi-secure-call-server
+*.test
+.DS_Store
+

@@ -1,0 +1,24 @@
+[Unit]
+Description=WiFi Secure Call signaling and media relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wifi-secure-call
+Group=wifi-secure-call
+EnvironmentFile=/opt/wifi-secure-call/config/server.env
+ExecStart=/opt/wifi-secure-call/bin/wifi-secure-call-server
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/wifi-secure-call/state
+ReadOnlyPaths=/opt/wifi-secure-call/config /opt/wifi-secure-call/secrets
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+
