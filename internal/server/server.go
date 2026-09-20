@@ -55,6 +55,11 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid registration")
 		return
 	}
+	prefix := body.Token
+	if len(prefix) > 8 {
+		prefix = prefix[:8]
+	}
+	slog.Info("APNs device registered", "role", role, "platform", body.Platform, "tokenPrefix", prefix, "tokenLength", len(body.Token))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -82,6 +87,8 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 				slog.Warn("APNs delivery failed", "status", "delivery_failed")
 			}
 		}()
+	} else {
+		slog.Warn("APNs delivery skipped", "callID", view.CallID, "role", view.Callee, "reason", "device_token_missing")
 	}
 	writeJSON(w, http.StatusOK, view)
 }

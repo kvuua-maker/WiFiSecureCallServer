@@ -10,6 +10,8 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"os"
@@ -58,9 +60,12 @@ func New(teamID, keyID, keyPath, topicIOS, topicWatch string) (*Client, error) {
 func (c *Client) Configured() bool { return true }
 func (c *Client) IncomingCall(ctx context.Context, role, deviceToken, callID string) error {
 	topic := c.topicIOS
+	platform := "iOS"
 	if role == "A" {
 		topic = c.topicWatch
+		platform = "watchOS"
 	}
+	expiration := time.Now().Add(30 * time.Second).Unix()
 	body, _ := json.Marshal(map[string]any{"aps": map[string]any{"alert": map[string]string{"title": "WiFi Secure Call", "body": "Incoming Wi-Fi call"}, "sound": "default", "category": "INCOMING_CALL", "interruption-level": "time-sensitive"}, "callID": callID, "event": "incoming_call"})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.push.apple.com/3/device/"+deviceToken, strings.NewReader(string(body)))
 	if err != nil {
@@ -74,15 +79,44 @@ func (c *Client) IncomingCall(ctx context.Context, role, deviceToken, callID str
 	req.Header.Set("apns-topic", topic)
 	req.Header.Set("apns-push-type", "alert")
 	req.Header.Set("apns-priority", "10")
-	req.Header.Set("apns-expiration", fmt.Sprint(time.Now().Add(30*time.Second).Unix()))
+	req.Header.Set("apns-expiration", fmt.Sprint(expiration))
 	req.Header.Set("content-type", "application/json")
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	reason := "Success"
 	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("APNs status %d", resp.StatusCode)
+		var payload struct {
+			Reason string `json:"reason"`
+		}
+		limited, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if json.Unmarshal(limited, &payload) == nil && payload.Reason != "" {
+			reason = payload.Reason
+		} else {
+			reason = "Unknown"
+		}
+	}
+	prefix := deviceToken
+	if len(prefix) > 8 {
+		prefix = prefix[:8]
+	}
+	slog.Info("APNs incoming-call response",
+		"callID", callID,
+		"destinationPlatform", platform,
+		"tokenPrefix", prefix,
+		"tokenLength", len(deviceToken),
+		"topic", topic,
+		"pushType", "alert",
+		"priority", 10,
+		"expiration", expiration,
+		"status", resp.StatusCode,
+		"reason", reason,
+		"apnsID", resp.Header.Get("apns-id"),
+	)
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("APNs status %d reason %s", resp.StatusCode, reason)
 	}
 	return nil
 }
