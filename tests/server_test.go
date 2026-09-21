@@ -100,6 +100,24 @@ func TestHealth(t *testing.T) {
 		t.Fatal(value)
 	}
 }
+
+func TestDeploymentPreservesProductionConfigAndExplicitlyRestarts(t *testing.T) {
+	script, err := os.ReadFile("../deploy/install-vps.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(script)
+	for _, forbidden := range []string{"APNS_ENABLED=false", "APNS_KEY_ID=\\n", "server.env.new", "enable --now"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("deployment contains forbidden production-config behavior: %q", forbidden)
+		}
+	}
+	for _, required := range []string{"systemctl restart wifi-secure-call.service", "production server.env is missing", "WSC_EXPECTED_BUILD", "running process does not match the staged binary"} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("deployment safety check missing: %q", required)
+		}
+	}
+}
 func TestDeviceRegistrationAndAuth(t *testing.T) {
 	srv, _, dir := fixture(t)
 	defer srv.Close()

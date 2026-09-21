@@ -404,7 +404,14 @@ func securityHeaders(next http.Handler) http.Handler {
 
 var _ = errors.New
 
+// embeddedBuild is set from the source commit by the production build command.
+// WSC_BUILD remains a development fallback for older deployment tooling.
+var embeddedBuild string
+
 func buildIdentity() string {
+	if value := strings.TrimSpace(embeddedBuild); value != "" {
+		return value
+	}
 	if value := strings.TrimSpace(os.Getenv("WSC_BUILD")); value != "" {
 		return value
 	}
