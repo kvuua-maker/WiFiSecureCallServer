@@ -235,9 +235,12 @@ func TestRuntimeAudioDiagnosticsAreAcceptedAndBounded(t *testing.T) {
 		"role":      "B", "platform": "iOS", "callID": callID,
 	}
 	for _, event := range []string{
+		"start_call_entered", "microphone_permission", "callkit_start_requested",
+		"callkit_start_approved", "server_call_create_started", "server_call_create_succeeded",
+		"new_call_blocked", "previous_terminal_reset",
 		"audio_session_configured", "callkit_did_activate", "callkit_did_deactivate",
 		"audio_engine_start_attempt", "audio_engine_start_success", "voice_processing_enabled",
-		"input_format", "output_format", "first_mic_buffer",
+		"input_format", "output_format", "capture_source_connected", "first_mic_buffer",
 		"first_network_audio_frame_generated", "first_network_audio_frame_sent",
 		"first_remote_audio_frame_received", "first_playback_buffer_scheduled",
 		"media_connect_started", "media_connect_succeeded", "media_disconnected",
@@ -250,6 +253,22 @@ func TestRuntimeAudioDiagnosticsAreAcceptedAndBounded(t *testing.T) {
 		body["event"] = event
 		body["status"] = "success"
 		resp := request(t, srv.URL, "POST", "/v1/devices/diagnostics", tokenB, body)
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("event %s: %d", event, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+
+	for _, event := range []string{"server_call_create_failed", "first_capture_conversion_failure", "first_network_audio_frame_send_failure"} {
+		failure := make(map[string]any, len(base)+5)
+		for key, value := range base {
+			failure[key] = value
+		}
+		failure["event"] = event
+		failure["status"] = "failed"
+		failure["errorDomain"] = "NSURLErrorDomain"
+		failure["errorCode"] = -1009
+		resp := request(t, srv.URL, "POST", "/v1/devices/diagnostics", tokenB, failure)
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("event %s: %d", event, resp.StatusCode)
 		}

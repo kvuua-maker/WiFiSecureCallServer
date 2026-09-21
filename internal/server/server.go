@@ -91,33 +91,45 @@ func (s *Server) notificationDiagnostics(w http.ResponseWriter, r *http.Request)
 	role := roleFrom(r.Context())
 	var body notificationDiagnosticRequest
 	allowedEvents := map[string]bool{
-		"notification_permission":             true,
-		"apns_registration_started":           true,
-		"apns_registration_succeeded":         true,
-		"apns_registration_failed":            true,
-		"callkit_error":                       true,
-		"audio_session_configured":            true,
-		"callkit_did_activate":                true,
-		"callkit_did_deactivate":              true,
-		"audio_engine_start_attempt":          true,
-		"audio_engine_start_success":          true,
-		"audio_engine_start_failure":          true,
-		"voice_processing_enabled":            true,
-		"input_format":                        true,
-		"output_format":                       true,
-		"first_mic_buffer":                    true,
-		"first_network_audio_frame_generated": true,
-		"first_network_audio_frame_sent":      true,
-		"first_remote_audio_frame_received":   true,
-		"first_playback_buffer_scheduled":     true,
-		"first_playback_failure":              true,
-		"media_connect_started":               true,
-		"media_connect_succeeded":             true,
-		"media_connect_failed":                true,
-		"media_disconnected":                  true,
-		"reconnect_started":                   true,
-		"reconnect_succeeded":                 true,
-		"reconnect_failed":                    true,
+		"notification_permission":                true,
+		"apns_registration_started":              true,
+		"apns_registration_succeeded":            true,
+		"apns_registration_failed":               true,
+		"callkit_error":                          true,
+		"start_call_entered":                     true,
+		"microphone_permission":                  true,
+		"callkit_start_requested":                true,
+		"callkit_start_approved":                 true,
+		"server_call_create_started":             true,
+		"server_call_create_succeeded":           true,
+		"server_call_create_failed":              true,
+		"new_call_blocked":                       true,
+		"previous_terminal_reset":                true,
+		"audio_session_configured":               true,
+		"callkit_did_activate":                   true,
+		"callkit_did_deactivate":                 true,
+		"audio_engine_start_attempt":             true,
+		"audio_engine_start_success":             true,
+		"audio_engine_start_failure":             true,
+		"voice_processing_enabled":               true,
+		"input_format":                           true,
+		"output_format":                          true,
+		"first_mic_buffer":                       true,
+		"capture_source_connected":               true,
+		"first_capture_conversion_failure":       true,
+		"first_network_audio_frame_generated":    true,
+		"first_network_audio_frame_sent":         true,
+		"first_network_audio_frame_send_failure": true,
+		"first_remote_audio_frame_received":      true,
+		"first_playback_buffer_scheduled":        true,
+		"first_playback_failure":                 true,
+		"media_connect_started":                  true,
+		"media_connect_succeeded":                true,
+		"media_connect_failed":                   true,
+		"media_disconnected":                     true,
+		"reconnect_started":                      true,
+		"reconnect_succeeded":                    true,
+		"reconnect_failed":                       true,
 	}
 	if decode(r, &body) != nil || !validID(body.RequestID) || body.Role != role || !allowedEvents[body.Event] || len(body.Status) > 256 || len(body.TokenPrefix) > 8 || body.TokenLength < 0 || body.TokenLength > 512 || len(body.Stage) > 32 || len(body.ErrorDomain) > 128 || (body.CallID != "" && !validID(body.CallID)) {
 		writeError(w, http.StatusBadRequest, "invalid diagnostics")
@@ -127,7 +139,7 @@ func (s *Server) notificationDiagnostics(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "invalid diagnostics")
 		return
 	}
-	errorEvent := body.Event == "callkit_error" || body.Event == "voice_processing_enabled" || body.Event == "audio_engine_start_failure" || body.Event == "first_playback_failure" || body.Event == "media_connect_failed" || body.Event == "media_disconnected"
+	errorEvent := body.Event == "callkit_error" || body.Event == "voice_processing_enabled" || body.Event == "audio_engine_start_failure" || body.Event == "first_capture_conversion_failure" || body.Event == "first_network_audio_frame_send_failure" || body.Event == "first_playback_failure" || body.Event == "media_connect_failed" || body.Event == "media_disconnected" || body.Event == "server_call_create_failed"
 	if !errorEvent && (body.Stage != "" || body.ErrorDomain != "" || body.ErrorCode != 0) {
 		writeError(w, http.StatusBadRequest, "invalid diagnostics")
 		return
