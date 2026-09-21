@@ -103,6 +103,7 @@ func (s *Server) notificationDiagnostics(w http.ResponseWriter, r *http.Request)
 		"server_call_create_started":             true,
 		"server_call_create_succeeded":           true,
 		"server_call_create_failed":              true,
+		"call_state_poll_failure":                true,
 		"new_call_blocked":                       true,
 		"previous_terminal_reset":                true,
 		"audio_session_configured":               true,
@@ -139,7 +140,7 @@ func (s *Server) notificationDiagnostics(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "invalid diagnostics")
 		return
 	}
-	errorEvent := body.Event == "callkit_error" || body.Event == "voice_processing_enabled" || body.Event == "audio_engine_start_failure" || body.Event == "first_capture_conversion_failure" || body.Event == "first_network_audio_frame_send_failure" || body.Event == "first_playback_failure" || body.Event == "media_connect_failed" || body.Event == "media_disconnected" || body.Event == "server_call_create_failed"
+	errorEvent := body.Event == "callkit_error" || body.Event == "voice_processing_enabled" || body.Event == "audio_engine_start_failure" || body.Event == "first_capture_conversion_failure" || body.Event == "first_network_audio_frame_send_failure" || body.Event == "first_playback_failure" || body.Event == "media_connect_failed" || body.Event == "media_disconnected" || body.Event == "server_call_create_failed" || body.Event == "call_state_poll_failure"
 	if !errorEvent && (body.Stage != "" || body.ErrorDomain != "" || body.ErrorCode != 0) {
 		writeError(w, http.StatusBadRequest, "invalid diagnostics")
 		return

@@ -259,7 +259,7 @@ func TestRuntimeAudioDiagnosticsAreAcceptedAndBounded(t *testing.T) {
 		resp.Body.Close()
 	}
 
-	for _, event := range []string{"server_call_create_failed", "first_capture_conversion_failure", "first_network_audio_frame_send_failure"} {
+	for _, event := range []string{"server_call_create_failed", "call_state_poll_failure", "first_capture_conversion_failure", "first_network_audio_frame_send_failure"} {
 		failure := make(map[string]any, len(base)+5)
 		for key, value := range base {
 			failure[key] = value
