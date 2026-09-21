@@ -25,10 +25,11 @@ tmp_file="$root/config/.server.env.new"
   printf 'APNS_KEY_PATH=/opt/wifi-secure-call/secrets/apns.p8\n'
   printf 'APNS_TOPIC_IOS=com.vkapps.wifisecurecall\n'
   printf 'APNS_TOPIC_WATCH=com.vkapps.wifisecurecall.watchkitapp\n'
+  printf 'APNS_TOPIC_IOS_VOIP=com.vkapps.wifisecurecall.voip\n'
+  printf 'APNS_TOPIC_WATCH_VOIP=com.vkapps.wifisecurecall.watchkitapp.voip\n'
 } > "$tmp_file"
 chown root:wifi-secure-call "$tmp_file"; chmod 0640 "$tmp_file"; mv "$tmp_file" "$env_file"
 install -o root -g root -m 0644 "$(dirname "$0")/wifi-secure-call.service" /etc/systemd/system/wifi-secure-call.service
 systemctl daemon-reload
 systemctl enable --now wifi-secure-call.service
 curl --fail --silent http://127.0.0.1:8790/v1/health >/dev/null
-

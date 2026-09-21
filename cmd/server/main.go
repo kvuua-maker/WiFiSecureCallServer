@@ -25,7 +25,11 @@ func main() {
 	}
 	var push apns.Sender = apns.Disabled{}
 	if cfg.APNSEnabled {
-		client, e := apns.New(cfg.APNSTeamID, cfg.APNSKeyID, cfg.APNSKeyPath, cfg.APNSTopicIOS, cfg.APNSTopicWatch)
+		client, e := apns.New(
+			cfg.APNSTeamID, cfg.APNSKeyID, cfg.APNSKeyPath,
+			cfg.APNSTopicIOS, cfg.APNSTopicWatch,
+			cfg.APNSTopicIOSVoIP, cfg.APNSTopicWatchVoIP,
+		)
 		if e != nil {
 			slog.Error("APNs configuration failed", "error", e)
 			os.Exit(1)

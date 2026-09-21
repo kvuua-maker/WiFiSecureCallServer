@@ -7,10 +7,11 @@ import (
 )
 
 type Config struct {
-	Address, StatePath, TokenA, TokenB                               string
-	APNSEnabled                                                      bool
-	APNSTeamID, APNSKeyID, APNSKeyPath, APNSTopicIOS, APNSTopicWatch string
-	RingTimeout, MediaGrace                                          time.Duration
+	Address, StatePath, TokenA, TokenB                                 string
+	APNSEnabled                                                        bool
+	APNSTeamID, APNSKeyID, APNSKeyPath                                 string
+	APNSTopicIOS, APNSTopicWatch, APNSTopicIOSVoIP, APNSTopicWatchVoIP string
+	RingTimeout, MediaGrace                                            time.Duration
 }
 
 func Load() (Config, error) {
@@ -19,6 +20,7 @@ func Load() (Config, error) {
 		TokenA: os.Getenv("WSC_TOKEN_A"), TokenB: os.Getenv("WSC_TOKEN_B"), APNSEnabled: os.Getenv("APNS_ENABLED") == "true",
 		APNSTeamID: os.Getenv("APNS_TEAM_ID"), APNSKeyID: os.Getenv("APNS_KEY_ID"), APNSKeyPath: os.Getenv("APNS_KEY_PATH"),
 		APNSTopicIOS: getenv("APNS_TOPIC_IOS", "com.vkapps.wifisecurecall"), APNSTopicWatch: getenv("APNS_TOPIC_WATCH", "com.vkapps.wifisecurecall.watchkitapp"),
+		APNSTopicIOSVoIP: getenv("APNS_TOPIC_IOS_VOIP", "com.vkapps.wifisecurecall.voip"), APNSTopicWatchVoIP: getenv("APNS_TOPIC_WATCH_VOIP", "com.vkapps.wifisecurecall.watchkitapp.voip"),
 		RingTimeout: 30 * time.Second, MediaGrace: 10 * time.Second,
 	}
 	if c.TokenA == "" || c.TokenB == "" || c.TokenA == c.TokenB {

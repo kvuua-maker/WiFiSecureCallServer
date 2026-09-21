@@ -10,10 +10,14 @@ import (
 )
 
 type Registration struct {
-	Role      string    `json:"role"`
-	Token     string    `json:"token"`
-	Platform  string    `json:"platform"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	Role           string    `json:"role"`
+	Platform       string    `json:"platform"`
+	Token          string    `json:"token,omitempty"`
+	AlertToken     string    `json:"alertToken,omitempty"`
+	VoIPToken      string    `json:"voipToken,omitempty"`
+	UpdatedAt      time.Time `json:"updatedAt"`
+	AlertUpdatedAt time.Time `json:"alertUpdatedAt,omitempty"`
+	VoIPUpdatedAt  time.Time `json:"voipUpdatedAt,omitempty"`
 }
 type Store struct {
 	mu     sync.RWMutex
@@ -28,24 +32,86 @@ func Open(path string) (*Store, error) {
 		if json.Unmarshal(data, &s.values) != nil {
 			return nil, errors.New("invalid device state")
 		}
+		migrated := false
+		for role, value := range s.values {
+			if value.AlertToken == "" && value.Token != "" {
+				value.AlertToken = value.Token
+				value.AlertUpdatedAt = value.UpdatedAt
+				value.Token = ""
+				s.values[role] = value
+				migrated = true
+			}
+		}
+		if migrated {
+			if err := s.persistLocked(); err != nil {
+				return nil, err
+			}
+		}
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
 	return s, nil
 }
 
-func (s *Store) Register(value Registration) error {
-	if value.Role != "A" && value.Role != "B" {
+func (s *Store) Register(role, platform, pushType, token string) error {
+	if role != "A" && role != "B" {
 		return errors.New("invalid role")
 	}
-	if value.Token == "" || len(value.Token) > 512 {
+	if pushType != "alert" && pushType != "voip" {
+		return errors.New("invalid push type")
+	}
+	if token == "" || len(token) > 512 {
 		return errors.New("invalid token")
 	}
-	value.UpdatedAt = time.Now().UTC()
+	now := time.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.values[value.Role] = value
+	value := s.values[role]
+	value.Role = role
+	value.Platform = platform
+	value.Token = ""
+	value.UpdatedAt = now
+	if pushType == "voip" {
+		value.VoIPToken = token
+		value.VoIPUpdatedAt = now
+	} else {
+		value.AlertToken = token
+		value.AlertUpdatedAt = now
+	}
+	s.values[role] = value
 	return s.persistLocked()
+}
+
+func (s *Store) Invalidate(role, pushType string) error {
+	if pushType != "alert" && pushType != "voip" {
+		return errors.New("invalid push type")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value, ok := s.values[role]
+	if !ok {
+		return nil
+	}
+	value.UpdatedAt = time.Now().UTC()
+	if pushType == "voip" {
+		value.VoIPToken = ""
+		value.VoIPUpdatedAt = time.Time{}
+	} else {
+		value.AlertToken = ""
+		value.AlertUpdatedAt = time.Time{}
+	}
+	s.values[role] = value
+	return s.persistLocked()
+}
+
+func (r Registration) TokenFor(pushType string) string {
+	if pushType == "voip" {
+		return r.VoIPToken
+	}
+	if r.AlertToken != "" {
+		return r.AlertToken
+	}
+	return r.Token
 }
 func (s *Store) Get(role string) (Registration, bool) {
 	s.mu.RLock()

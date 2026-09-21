@@ -26,8 +26,22 @@ const callID = "11111111-2222-4333-8444-555555555555"
 
 type pushStub struct{ configured bool }
 
-func (p pushStub) IncomingCall(context.Context, string, string, string) error { return nil }
-func (p pushStub) Configured() bool                                           { return p.configured }
+func (p pushStub) IncomingCall(context.Context, string, string, string, string) error { return nil }
+func (p pushStub) Configured() bool                                                   { return p.configured }
+
+type pushAttempt struct {
+	role, token, callID, pushType string
+}
+
+type pushRecorder struct {
+	attempts chan pushAttempt
+}
+
+func (p *pushRecorder) IncomingCall(_ context.Context, role, token, callID, pushType string) error {
+	p.attempts <- pushAttempt{role: role, token: token, callID: callID, pushType: pushType}
+	return nil
+}
+func (p *pushRecorder) Configured() bool { return true }
 
 func fixture(t *testing.T) (*httptest.Server, *calls.Store, string) {
 	t.Helper()
@@ -79,7 +93,7 @@ func TestHealth(t *testing.T) {
 func TestDeviceRegistrationAndAuth(t *testing.T) {
 	srv, _, dir := fixture(t)
 	defer srv.Close()
-	body := map[string]string{"requestID": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "role": "A", "token": "abc123", "platform": "watchOS"}
+	body := map[string]string{"requestID": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "role": "A", "token": "abc123", "platform": "watchOS", "pushType": "alert"}
 	resp := request(t, srv.URL, "POST", "/v1/devices/register", tokenA, body)
 	if resp.StatusCode != 204 {
 		t.Fatal(resp.StatusCode)
@@ -94,6 +108,78 @@ func TestDeviceRegistrationAndAuth(t *testing.T) {
 		t.Fatal(bad.StatusCode)
 	}
 	bad.Body.Close()
+}
+
+func TestLegacyTokenMigratesToAlertToken(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "devices.json")
+	legacy := `{"A":{"role":"A","token":"legacy-alert","platform":"watchOS","updatedAt":"2026-09-21T01:02:03Z"}}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := devices.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, ok := store.Get("A")
+	if !ok || value.TokenFor("alert") != "legacy-alert" || value.TokenFor("voip") != "" {
+		t.Fatalf("legacy migration failed: %+v", value)
+	}
+	persisted, _ := os.ReadFile(path)
+	if bytes.Contains(persisted, []byte(`"token":"legacy-alert"`)) || !bytes.Contains(persisted, []byte(`"alertToken":"legacy-alert"`)) {
+		t.Fatal("legacy token was not persisted as alert token")
+	}
+}
+
+func TestAlertAndVoIPTokensCoexistWithoutCrossRoleOverwrite(t *testing.T) {
+	store, err := devices.Open(filepath.Join(t.TempDir(), "devices.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Register("A", "watchOS", "alert", "a-alert"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Register("A", "watchOS", "voip", "a-voip"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Register("B", "iOS", "voip", "b-voip"); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := store.Get("A")
+	b, _ := store.Get("B")
+	if a.TokenFor("alert") != "a-alert" || a.TokenFor("voip") != "a-voip" {
+		t.Fatalf("A tokens overwritten: %+v", a)
+	}
+	if b.TokenFor("voip") != "b-voip" || b.TokenFor("alert") != "" {
+		t.Fatalf("role isolation failed: %+v", b)
+	}
+}
+
+func TestLiveCallPrefersCalleeVoIPToken(t *testing.T) {
+	dir := t.TempDir()
+	deviceStore, err := devices.Open(filepath.Join(dir, "devices.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := deviceStore.Register("B", "iOS", "alert", "b-alert"); err != nil {
+		t.Fatal(err)
+	}
+	if err := deviceStore.Register("B", "iOS", "voip", "b-voip"); err != nil {
+		t.Fatal(err)
+	}
+	recorder := &pushRecorder{attempts: make(chan pushAttempt, 1)}
+	srv := httptest.NewServer(appserver.New(tokenA, tokenB, calls.New(30*time.Second, 10*time.Second), deviceStore, recorder).Handler())
+	defer srv.Close()
+	resp := request(t, srv.URL, "POST", "/v1/calls", tokenA, createBody())
+	resp.Body.Close()
+	select {
+	case attempt := <-recorder.attempts:
+		if attempt.role != "B" || attempt.token != "b-voip" || attempt.pushType != "voip" || attempt.callID != callID {
+			t.Fatalf("unexpected push attempt: %+v", attempt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("push not attempted")
+	}
 }
 func TestNotificationDiagnosticsAuthAndValidation(t *testing.T) {
 	srv, _, _ := fixture(t)
@@ -113,6 +199,27 @@ func TestNotificationDiagnosticsAuthAndValidation(t *testing.T) {
 	}
 	resp.Body.Close()
 	body["role"] = "A"
+	bad := request(t, srv.URL, "POST", "/v1/devices/diagnostics", tokenB, body)
+	if bad.StatusCode != http.StatusBadRequest {
+		t.Fatal(bad.StatusCode)
+	}
+	bad.Body.Close()
+}
+
+func TestCallKitErrorDiagnosticIsAcceptedAndBounded(t *testing.T) {
+	srv, _, _ := fixture(t)
+	defer srv.Close()
+	body := map[string]any{
+		"requestID": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+		"role":      "B", "platform": "iOS", "event": "callkit_error", "status": "failed",
+		"stage": "reportIncoming", "errorDomain": "com.apple.CallKit.error.incomingcall", "errorCode": 4,
+	}
+	resp := request(t, srv.URL, "POST", "/v1/devices/diagnostics", tokenB, body)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatal(resp.StatusCode)
+	}
+	resp.Body.Close()
+	body["errorDomain"] = strings.Repeat("x", 129)
 	bad := request(t, srv.URL, "POST", "/v1/devices/diagnostics", tokenB, body)
 	if bad.StatusCode != http.StatusBadRequest {
 		t.Fatal(bad.StatusCode)

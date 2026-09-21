@@ -43,21 +43,38 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "apnsConfigured": s.apns.Configured()})
 }
 
-type registerRequest struct{ RequestID, Role, Token, Platform string }
+type registerRequest struct{ RequestID, Role, Token, Platform, PushType string }
 
 type notificationDiagnosticRequest struct {
 	RequestID, Role, Platform, Event, Status, TokenPrefix string
-	TokenLength                                           int
+	Stage, ErrorDomain                                    string
+	TokenLength, ErrorCode                                int
 }
 
 func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	role := roleFrom(r.Context())
 	var body registerRequest
-	if decode(r, &body) != nil || body.Role != role {
+	if decode(r, &body) != nil {
 		writeError(w, http.StatusBadRequest, "invalid registration")
 		return
 	}
-	if err := s.devices.Register(devices.Registration{Role: role, Token: body.Token, Platform: body.Platform}); err != nil {
+	if body.PushType == "" {
+		body.PushType = "alert"
+	}
+	if !validID(body.RequestID) || body.Role != role || (body.PushType != "alert" && body.PushType != "voip") {
+		writeError(w, http.StatusBadRequest, "invalid registration")
+		return
+	}
+	if body.Token == "" {
+		if err := s.devices.Invalidate(role, body.PushType); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid registration")
+			return
+		}
+		slog.Info("push token invalidated", "role", role, "platform", body.Platform, "pushType", body.PushType)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err := s.devices.Register(role, body.Platform, body.PushType, body.Token); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid registration")
 		return
 	}
@@ -65,7 +82,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	if len(prefix) > 8 {
 		prefix = prefix[:8]
 	}
-	slog.Info("APNs device registered", "role", role, "platform", body.Platform, "tokenPrefix", prefix, "tokenLength", len(body.Token))
+	slog.Info("APNs device registered", "role", role, "platform", body.Platform, "pushType", body.PushType, "tokenPrefix", prefix, "tokenLength", len(body.Token))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -77,9 +94,23 @@ func (s *Server) notificationDiagnostics(w http.ResponseWriter, r *http.Request)
 		"apns_registration_started":   true,
 		"apns_registration_succeeded": true,
 		"apns_registration_failed":    true,
+		"callkit_error":               true,
 	}
-	if decode(r, &body) != nil || !validID(body.RequestID) || body.Role != role || !allowedEvents[body.Event] || len(body.Status) > 128 || len(body.TokenPrefix) > 8 || body.TokenLength < 0 || body.TokenLength > 512 {
+	if decode(r, &body) != nil || !validID(body.RequestID) || body.Role != role || !allowedEvents[body.Event] || len(body.Status) > 128 || len(body.TokenPrefix) > 8 || body.TokenLength < 0 || body.TokenLength > 512 || len(body.Stage) > 32 || len(body.ErrorDomain) > 128 {
 		writeError(w, http.StatusBadRequest, "invalid diagnostics")
+		return
+	}
+	if body.Event == "callkit_error" && (body.Stage == "" || body.ErrorDomain == "") {
+		writeError(w, http.StatusBadRequest, "invalid diagnostics")
+		return
+	}
+	if body.Event != "callkit_error" && (body.Stage != "" || body.ErrorDomain != "" || body.ErrorCode != 0) {
+		writeError(w, http.StatusBadRequest, "invalid diagnostics")
+		return
+	}
+	if body.Event == "callkit_error" {
+		slog.Warn("CallKit error diagnostic", "role", role, "platform", body.Platform, "stage", body.Stage, "domain", body.ErrorDomain, "code", body.ErrorCode)
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	slog.Info("notification registration diagnostic", "role", role, "platform", body.Platform, "event", body.Event, "status", body.Status, "tokenPrefix", body.TokenPrefix, "tokenLength", body.TokenLength)
@@ -104,15 +135,26 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("call created", "callID", view.CallID, "caller", view.Caller, "callee", view.Callee, "state", view.State)
 	if device, ok := s.devices.Get(view.Callee); ok {
-		prefix := device.Token
+		pushType := "voip"
+		token := device.TokenFor(pushType)
+		if token == "" {
+			pushType = "alert"
+			token = device.TokenFor(pushType)
+		}
+		if token == "" {
+			slog.Warn("APNs delivery skipped", "callID", view.CallID, "role", view.Callee, "reason", "device_token_missing")
+			writeJSON(w, http.StatusOK, view)
+			return
+		}
+		prefix := token
 		if len(prefix) > 8 {
 			prefix = prefix[:8]
 		}
-		slog.Info("APNs delivery attempted", "callID", view.CallID, "role", view.Callee, "platform", device.Platform, "tokenPrefix", prefix, "tokenLength", len(device.Token))
+		slog.Info("APNs delivery attempted", "callID", view.CallID, "role", view.Callee, "platform", device.Platform, "pushType", pushType, "tokenPrefix", prefix, "tokenLength", len(token))
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 			defer cancel()
-			if err := s.apns.IncomingCall(ctx, view.Callee, device.Token, view.CallID); err != nil {
+			if err := s.apns.IncomingCall(ctx, view.Callee, token, view.CallID, pushType); err != nil {
 				slog.Warn("APNs delivery failed", "status", "delivery_failed")
 			}
 		}()
