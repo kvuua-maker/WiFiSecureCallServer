@@ -138,6 +138,49 @@ func TestCreateAndIdempotentCreate(t *testing.T) {
 		t.Fatal(view)
 	}
 }
+func TestCallViewExpiresAtUsesWholeSecondRFC3339WithoutChangingTimeout(t *testing.T) {
+	store := calls.New(30*time.Second, 10*time.Second)
+	base := time.Date(2026, time.September, 21, 2, 15, 0, 123456789, time.UTC)
+	now := base
+	store.SetClock(func() time.Time { return now })
+	view, err := store.Create(callID, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "A")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	payload, err := json.Marshal(view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		ExpiresAt string `json:"expiresAt"`
+	}
+	if err := json.Unmarshal(payload, &wire); err != nil {
+		t.Fatal(err)
+	}
+	want := base.Add(30 * time.Second).UTC().Truncate(time.Second)
+	parsed, err := time.Parse(time.RFC3339, wire.ExpiresAt)
+	if err != nil {
+		t.Fatalf("expiresAt is not RFC3339: %q: %v", wire.ExpiresAt, err)
+	}
+	if strings.Contains(wire.ExpiresAt, ".") {
+		t.Fatalf("expiresAt contains fractional seconds: %q", wire.ExpiresAt)
+	}
+	if !parsed.Equal(want) || !view.ExpiresAt.Equal(want) {
+		t.Fatalf("expiresAt = %s, want %s", wire.ExpiresAt, want.Format(time.RFC3339))
+	}
+
+	now = base.Add(30*time.Second - time.Nanosecond)
+	beforeExpiry, _ := store.Get(callID, "A")
+	if beforeExpiry.State != calls.Ringing {
+		t.Fatalf("call expired before precise internal deadline: %s", beforeExpiry.State)
+	}
+	now = base.Add(30 * time.Second)
+	atExpiry, _ := store.Get(callID, "A")
+	if atExpiry.State != calls.Expired {
+		t.Fatalf("call did not expire at precise internal deadline: %s", atExpiry.State)
+	}
+}
 func TestAcceptRejectCancelAndExpiration(t *testing.T) {
 	for _, tc := range []struct {
 		name, action, token string

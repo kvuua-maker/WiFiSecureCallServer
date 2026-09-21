@@ -147,7 +147,7 @@ func (s *Store) expireLocked(call *Call) {
 	}
 }
 func (s *Store) viewLocked(call *Call, role string) View {
-	v := View{CallID: call.ID, Caller: call.Caller, Callee: call.Callee, State: call.State, ExpiresAt: call.ExpiresAt}
+	v := View{CallID: call.ID, Caller: call.Caller, Callee: call.Callee, State: call.State, ExpiresAt: call.ExpiresAt.UTC().Truncate(time.Second)}
 	if call.State == Accepted {
 		if role == "A" {
 			v.MediaToken = call.tokenA
