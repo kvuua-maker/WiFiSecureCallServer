@@ -21,13 +21,21 @@ import (
 )
 
 type Sender interface {
-	IncomingCall(context.Context, string, string, string, string) error
+	IncomingCall(context.Context, string, string, string, string, time.Time) (Result, error)
 	Configured() bool
+}
+type Result struct {
+	Status                            int
+	Reason, APNSID                    string
+	Timestamp                         time.Time
+	Retryable, DeadToken, AuthFailure bool
 }
 type Disabled struct{}
 
-func (Disabled) IncomingCall(context.Context, string, string, string, string) error { return nil }
-func (Disabled) Configured() bool                                                   { return false }
+func (Disabled) IncomingCall(context.Context, string, string, string, string, time.Time) (Result, error) {
+	return Result{}, errors.New("APNs disabled")
+}
+func (Disabled) Configured() bool { return false }
 
 type Client struct {
 	teamID, keyID                  string
@@ -66,14 +74,26 @@ func New(teamID, keyID, keyPath, topicIOSAlert, topicWatchAlert, topicIOSVoIP, t
 	}, nil
 }
 func (c *Client) Configured() bool { return true }
-func (c *Client) IncomingCall(ctx context.Context, role, deviceToken, callID, pushType string) error {
+func (c *Client) IncomingCall(ctx context.Context, role, deviceToken, callID, pushType string, ringExpiresAt time.Time) (Result, error) {
+	result, err := c.incomingCall(ctx, role, deviceToken, callID, pushType, ringExpiresAt)
+	if result.Reason == "ExpiredProviderToken" {
+		c.mu.Lock()
+		c.jwt = ""
+		c.jwtAt = time.Time{}
+		c.mu.Unlock()
+		return c.incomingCall(ctx, role, deviceToken, callID, pushType, ringExpiresAt)
+	}
+	return result, err
+}
+
+func (c *Client) incomingCall(ctx context.Context, role, deviceToken, callID, pushType string, ringExpiresAt time.Time) (Result, error) {
 	topic := c.topicIOSAlert
 	platform := "iOS"
 	if role == "A" {
 		topic = c.topicWatchAlert
 		platform = "watchOS"
 	}
-	expiration := time.Now().Add(30 * time.Second).Unix()
+	expiration := ringExpiresAt.Unix()
 	priority := "10"
 	bodyValue := map[string]any{
 		"aps": map[string]any{
@@ -98,11 +118,11 @@ func (c *Client) IncomingCall(ctx context.Context, role, deviceToken, callID, pu
 	body, _ := json.Marshal(bodyValue)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.push.apple.com/3/device/"+deviceToken, strings.NewReader(string(body)))
 	if err != nil {
-		return err
+		return Result{}, err
 	}
 	token, err := c.bearer()
 	if err != nil {
-		return err
+		return Result{}, err
 	}
 	req.Header.Set("authorization", "bearer "+token)
 	req.Header.Set("apns-topic", topic)
@@ -112,13 +132,15 @@ func (c *Client) IncomingCall(ctx context.Context, role, deviceToken, callID, pu
 	req.Header.Set("content-type", "application/json")
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return Result{}, err
 	}
 	defer resp.Body.Close()
 	reason := "Success"
+	var apnsTimestamp time.Time
 	if resp.StatusCode/100 != 2 {
 		var payload struct {
-			Reason string `json:"reason"`
+			Reason    string `json:"reason"`
+			Timestamp int64  `json:"timestamp"`
 		}
 		limited, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		if json.Unmarshal(limited, &payload) == nil && payload.Reason != "" {
@@ -126,15 +148,13 @@ func (c *Client) IncomingCall(ctx context.Context, role, deviceToken, callID, pu
 		} else {
 			reason = "Unknown"
 		}
-	}
-	prefix := deviceToken
-	if len(prefix) > 8 {
-		prefix = prefix[:8]
+		if payload.Timestamp > 0 {
+			apnsTimestamp = time.UnixMilli(payload.Timestamp).UTC()
+		}
 	}
 	slog.Info("APNs incoming-call response",
 		"callID", callID,
 		"destinationPlatform", platform,
-		"tokenPrefix", prefix,
 		"tokenLength", len(deviceToken),
 		"topic", topic,
 		"pushType", pushType,
@@ -144,10 +164,11 @@ func (c *Client) IncomingCall(ctx context.Context, role, deviceToken, callID, pu
 		"reason", reason,
 		"apnsID", resp.Header.Get("apns-id"),
 	)
+	result := Result{Status: resp.StatusCode, Reason: reason, APNSID: resp.Header.Get("apns-id"), Timestamp: apnsTimestamp, Retryable: resp.StatusCode == 429 || resp.StatusCode >= 500, DeadToken: resp.StatusCode == 410 || reason == "BadDeviceToken" || reason == "DeviceTokenNotForTopic" || reason == "Unregistered", AuthFailure: reason == "ExpiredProviderToken" || reason == "InvalidProviderToken"}
 	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("APNs status %d reason %s", resp.StatusCode, reason)
+		return result, fmt.Errorf("APNs status %d reason %s", resp.StatusCode, reason)
 	}
-	return nil
+	return result, nil
 }
 func (c *Client) bearer() (string, error) {
 	c.mu.Lock()

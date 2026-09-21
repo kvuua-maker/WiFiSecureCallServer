@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -11,7 +12,7 @@ type Config struct {
 	APNSEnabled                                                        bool
 	APNSTeamID, APNSKeyID, APNSKeyPath                                 string
 	APNSTopicIOS, APNSTopicWatch, APNSTopicIOSVoIP, APNSTopicWatchVoIP string
-	RingTimeout, MediaGrace                                            time.Duration
+	RingTimeout                                                        time.Duration
 }
 
 func Load() (Config, error) {
@@ -21,9 +22,9 @@ func Load() (Config, error) {
 		APNSTeamID: os.Getenv("APNS_TEAM_ID"), APNSKeyID: os.Getenv("APNS_KEY_ID"), APNSKeyPath: os.Getenv("APNS_KEY_PATH"),
 		APNSTopicIOS: getenv("APNS_TOPIC_IOS", "com.vkapps.wifisecurecall"), APNSTopicWatch: getenv("APNS_TOPIC_WATCH", "com.vkapps.wifisecurecall.watchkitapp"),
 		APNSTopicIOSVoIP: getenv("APNS_TOPIC_IOS_VOIP", "com.vkapps.wifisecurecall.voip"), APNSTopicWatchVoIP: getenv("APNS_TOPIC_WATCH_VOIP", "com.vkapps.wifisecurecall.watchkitapp.voip"),
-		RingTimeout: 30 * time.Second, MediaGrace: 10 * time.Second,
+		RingTimeout: 30 * time.Second,
 	}
-	if c.TokenA == "" || c.TokenB == "" || c.TokenA == c.TokenB {
+	if len(c.TokenA) < 32 || len(c.TokenB) < 32 || c.TokenA == c.TokenB || strings.ContainsAny(c.TokenA+c.TokenB, " \t\r\n") {
 		return Config{}, errors.New("distinct WSC_TOKEN_A and WSC_TOKEN_B are required")
 	}
 	if c.APNSEnabled && (c.APNSTeamID == "" || c.APNSKeyID == "" || c.APNSKeyPath == "") {

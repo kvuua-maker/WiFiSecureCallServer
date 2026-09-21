@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/apns"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/calls"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/devices"
 	appserver "github.com/kvuua-maker/wifi-secure-call-server/internal/server"
@@ -26,8 +28,10 @@ const callID = "11111111-2222-4333-8444-555555555555"
 
 type pushStub struct{ configured bool }
 
-func (p pushStub) IncomingCall(context.Context, string, string, string, string) error { return nil }
-func (p pushStub) Configured() bool                                                   { return p.configured }
+func (p pushStub) IncomingCall(context.Context, string, string, string, string, time.Time) (apns.Result, error) {
+	return apns.Result{Status: http.StatusOK, Reason: "Success"}, nil
+}
+func (p pushStub) Configured() bool { return p.configured }
 
 type pushAttempt struct {
 	role, token, callID, pushType string
@@ -36,10 +40,16 @@ type pushAttempt struct {
 type pushRecorder struct {
 	attempts chan pushAttempt
 }
+type pushFailure struct{}
 
-func (p *pushRecorder) IncomingCall(_ context.Context, role, token, callID, pushType string) error {
+func (pushFailure) IncomingCall(context.Context, string, string, string, string, time.Time) (apns.Result, error) {
+	return apns.Result{Status: 410, Reason: "Unregistered", DeadToken: true}, errors.New("APNs rejected token")
+}
+func (pushFailure) Configured() bool { return true }
+
+func (p *pushRecorder) IncomingCall(_ context.Context, role, token, callID, pushType string, _ time.Time) (apns.Result, error) {
 	p.attempts <- pushAttempt{role: role, token: token, callID: callID, pushType: pushType}
-	return nil
+	return apns.Result{Status: http.StatusOK, Reason: "Success"}, nil
 }
 func (p *pushRecorder) Configured() bool { return true }
 
@@ -93,14 +103,14 @@ func TestHealth(t *testing.T) {
 func TestDeviceRegistrationAndAuth(t *testing.T) {
 	srv, _, dir := fixture(t)
 	defer srv.Close()
-	body := map[string]string{"requestID": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "role": "A", "token": "abc123", "platform": "watchOS", "pushType": "alert"}
+	body := map[string]any{"requestID": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "role": "A", "token": tokenA, "platform": "watchOS", "pushType": "alert", "installationID": callID, "installationGeneration": 1, "environment": "production", "capabilities": map[string]bool{"alertPush": true, "voipPush": false, "notificationsAuthorized": true, "microphoneReady": true}}
 	resp := request(t, srv.URL, "POST", "/v1/devices/register", tokenA, body)
 	if resp.StatusCode != 204 {
 		t.Fatal(resp.StatusCode)
 	}
 	resp.Body.Close()
 	data, err := os.ReadFile(filepath.Join(dir, "devices.json"))
-	if err != nil || !bytes.Contains(data, []byte("abc123")) {
+	if err != nil || !bytes.Contains(data, []byte(tokenA)) {
 		t.Fatal("registration not persisted")
 	}
 	bad := request(t, srv.URL, "POST", "/v1/devices/register", "wrong", body)
@@ -113,7 +123,7 @@ func TestDeviceRegistrationAndAuth(t *testing.T) {
 func TestLegacyTokenMigratesToAlertToken(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "devices.json")
-	legacy := `{"A":{"role":"A","token":"legacy-alert","platform":"watchOS","updatedAt":"2026-09-21T01:02:03Z"}}`
+	legacy := `{"A":{"role":"A","token":"` + tokenA + `","platform":"watchOS","updatedAt":"2026-09-21T01:02:03Z"}}`
 	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -122,11 +132,11 @@ func TestLegacyTokenMigratesToAlertToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	value, ok := store.Get("A")
-	if !ok || value.TokenFor("alert") != "legacy-alert" || value.TokenFor("voip") != "" {
+	if !ok || value.TokenFor("alert", "production") != tokenA || value.TokenFor("voip", "production") != "" {
 		t.Fatalf("legacy migration failed: %+v", value)
 	}
 	persisted, _ := os.ReadFile(path)
-	if bytes.Contains(persisted, []byte(`"token":"legacy-alert"`)) || !bytes.Contains(persisted, []byte(`"alertToken":"legacy-alert"`)) {
+	if bytes.Contains(persisted, []byte(`"token":"`+tokenA+`"`)) || !bytes.Contains(persisted, []byte(`"alertToken":"`+tokenA+`"`)) {
 		t.Fatal("legacy token was not persisted as alert token")
 	}
 }
@@ -136,21 +146,23 @@ func TestAlertAndVoIPTokensCoexistWithoutCrossRoleOverwrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Register("A", "watchOS", "alert", "a-alert"); err != nil {
+	aAlert, aVoIP, bVoIP := strings.Repeat("a", 64), strings.Repeat("c", 64), strings.Repeat("b", 64)
+	caps := devices.Capabilities{VoIPPush: true, AlertPush: true, NotificationsAuthorized: true, MicrophoneReady: true}
+	if err := store.Register("A", "watchOS", "alert", aAlert, callID, 1, "production", caps); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Register("A", "watchOS", "voip", "a-voip"); err != nil {
+	if err := store.Register("A", "watchOS", "voip", aVoIP, callID, 1, "production", caps); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Register("B", "iOS", "voip", "b-voip"); err != nil {
+	if err := store.Register("B", "iOS", "voip", bVoIP, callID, 1, "production", caps); err != nil {
 		t.Fatal(err)
 	}
 	a, _ := store.Get("A")
 	b, _ := store.Get("B")
-	if a.TokenFor("alert") != "a-alert" || a.TokenFor("voip") != "a-voip" {
+	if a.TokenFor("alert", "production") != aAlert || a.TokenFor("voip", "production") != aVoIP {
 		t.Fatalf("A tokens overwritten: %+v", a)
 	}
-	if b.TokenFor("voip") != "b-voip" || b.TokenFor("alert") != "" {
+	if b.TokenFor("voip", "production") != bVoIP || b.TokenFor("alert", "production") != "" {
 		t.Fatalf("role isolation failed: %+v", b)
 	}
 }
@@ -161,10 +173,12 @@ func TestLiveCallPrefersCalleeVoIPToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := deviceStore.Register("B", "iOS", "alert", "b-alert"); err != nil {
+	bAlert, bVoIP := strings.Repeat("d", 64), strings.Repeat("b", 64)
+	caps := devices.Capabilities{VoIPPush: true, AlertPush: true, NotificationsAuthorized: true, MicrophoneReady: true}
+	if err := deviceStore.Register("B", "iOS", "alert", bAlert, callID, 1, "production", caps); err != nil {
 		t.Fatal(err)
 	}
-	if err := deviceStore.Register("B", "iOS", "voip", "b-voip"); err != nil {
+	if err := deviceStore.Register("B", "iOS", "voip", bVoIP, callID, 1, "production", caps); err != nil {
 		t.Fatal(err)
 	}
 	recorder := &pushRecorder{attempts: make(chan pushAttempt, 1)}
@@ -174,7 +188,7 @@ func TestLiveCallPrefersCalleeVoIPToken(t *testing.T) {
 	resp.Body.Close()
 	select {
 	case attempt := <-recorder.attempts:
-		if attempt.role != "B" || attempt.token != "b-voip" || attempt.pushType != "voip" || attempt.callID != callID {
+		if attempt.role != "B" || attempt.token != bVoIP || attempt.pushType != "voip" || attempt.callID != callID {
 			t.Fatalf("unexpected push attempt: %+v", attempt)
 		}
 	case <-time.After(time.Second):
@@ -327,12 +341,170 @@ func TestCreateAndIdempotentCreate(t *testing.T) {
 		t.Fatal(view)
 	}
 }
+
+func TestDuplicateCreateSubmitsExactlyOnePush(t *testing.T) {
+	deviceStore, err := devices.Open(filepath.Join(t.TempDir(), "devices.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	caps := devices.Capabilities{VoIPPush: true, MicrophoneReady: true}
+	if err = deviceStore.Register("B", "iOS", "voip", strings.Repeat("b", 64), callID, 1, "production", caps); err != nil {
+		t.Fatal(err)
+	}
+	recorder := &pushRecorder{attempts: make(chan pushAttempt, 2)}
+	srv := httptest.NewServer(appserver.New(tokenA, tokenB, calls.New(30*time.Second, 0), deviceStore, recorder).Handler())
+	defer srv.Close()
+	request(t, srv.URL, "POST", "/v1/calls", tokenA, createBody()).Body.Close()
+	request(t, srv.URL, "POST", "/v1/calls", tokenA, createBody()).Body.Close()
+	select {
+	case <-recorder.attempts:
+	case <-time.After(time.Second):
+		t.Fatal("push not submitted")
+	}
+	select {
+	case <-recorder.attempts:
+		t.Fatal("duplicate create submitted a second push")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestAPNsFailureBecomesAuthoritativeTerminalState(t *testing.T) {
+	deviceStore, err := devices.Open(filepath.Join(t.TempDir(), "devices.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = deviceStore.Register("B", "iOS", "voip", strings.Repeat("b", 64), callID, 1, "production", devices.Capabilities{VoIPPush: true, MicrophoneReady: true}); err != nil {
+		t.Fatal(err)
+	}
+	store := calls.New(30*time.Second, 0)
+	srv := httptest.NewServer(appserver.New(tokenA, tokenB, store, deviceStore, pushFailure{}).Handler())
+	defer srv.Close()
+	request(t, srv.URL, "POST", "/v1/calls", tokenA, createBody()).Body.Close()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		view, _ := store.Get(callID, "A")
+		if view.State == calls.Expired {
+			if view.TerminalReason != "delivery_failed:Unregistered" || view.DeliveryStatus != "submission_failed:Unregistered" {
+				t.Fatalf("unexpected delivery state: %+v", view)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("APNs failure did not terminate ringing call")
+}
+
+func TestMutationIdempotencyRejectsParameterMismatch(t *testing.T) {
+	store := calls.New(30*time.Second, 0)
+	_, _, _ = store.Create(callID, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "A")
+	requestID := "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+	if _, applied, err := store.Mutate(callID, requestID, "B", calls.Accepted); err != nil || !applied {
+		t.Fatalf("accept failed: %v", err)
+	}
+	if _, _, err := store.Mutate(callID, requestID, "B", calls.Ended); err == nil || !strings.Contains(err.Error(), "idempotency conflict") {
+		t.Fatalf("expected conflict, got %v", err)
+	}
+}
+
+func TestConditionalTokenInvalidationCannotDeleteNewerToken(t *testing.T) {
+	store, err := devices.Open(filepath.Join(t.TempDir(), "devices.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldToken, newToken := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	caps := devices.Capabilities{VoIPPush: true, MicrophoneReady: true}
+	if err = store.Register("A", "watchOS", "voip", oldToken, callID, 7, "production", caps); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Register("A", "watchOS", "voip", newToken, callID, 7, "production", caps); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Invalidate("A", "voip", callID, 7, oldToken); err != nil {
+		t.Fatal(err)
+	}
+	value, _ := store.Get("A")
+	if value.TokenFor("voip", "production") != newToken {
+		t.Fatal("stale invalidation removed newer token")
+	}
+	if err = store.Invalidate("A", "voip", callID, 7, newToken); err != nil {
+		t.Fatal(err)
+	}
+	value, _ = store.Get("A")
+	if value.TokenFor("voip", "production") != "" {
+		t.Fatal("current token was not invalidated")
+	}
+}
+
+func TestStrictBearerRolePlatformAndJSONLimits(t *testing.T) {
+	srv, _, _ := fixture(t)
+	defer srv.Close()
+	raw, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/calls", strings.NewReader(`{}`))
+	raw.Header.Set("Authorization", tokenA)
+	resp, err := http.DefaultClient.Do(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("raw bearer accepted: %d", resp.StatusCode)
+	}
+	body := map[string]any{"requestID": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "role": "B", "token": strings.Repeat("b", 64), "platform": "watchOS", "pushType": "alert"}
+	resp = request(t, srv.URL, "POST", "/v1/devices/register", tokenB, body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("role/platform mismatch accepted: %d", resp.StatusCode)
+	}
+	trailing, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/calls", strings.NewReader(`{"requestID":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","callID":"`+callID+`"}{}`))
+	trailing.Header.Set("Authorization", "Bearer "+tokenA)
+	trailing.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(trailing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("trailing JSON accepted: %d", resp.StatusCode)
+	}
+	oversized, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/calls", strings.NewReader(strings.Repeat("x", 5000)))
+	oversized.Header.Set("Authorization", "Bearer "+tokenA)
+	oversized.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(oversized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized body status: %d", resp.StatusCode)
+	}
+}
+
+func TestCorruptedDeviceStateFailsClosedAndEnvironmentDoesNotMix(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "devices.json")
+	if err := os.WriteFile(path, []byte(`{"schemaVersion":2,"devices":{"A":{"role":"A"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := devices.Open(path); err == nil {
+		t.Fatal("corrupted state accepted")
+	}
+	store, err := devices.Open(filepath.Join(t.TempDir(), "devices.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := strings.Repeat("a", 64)
+	if err = store.Register("A", "watchOS", "voip", token, callID, 1, "development", devices.Capabilities{}); err != nil {
+		t.Fatal(err)
+	}
+	value, _ := store.Get("A")
+	if value.TokenFor("voip", "production") != "" || value.TokenFor("voip", "development") != token {
+		t.Fatal("APNs environments mixed")
+	}
+}
 func TestCallViewExpiresAtUsesWholeSecondRFC3339WithoutChangingTimeout(t *testing.T) {
 	store := calls.New(30*time.Second, 10*time.Second)
 	base := time.Date(2026, time.September, 21, 2, 15, 0, 123456789, time.UTC)
 	now := base
 	store.SetClock(func() time.Time { return now })
-	view, err := store.Create(callID, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "A")
+	view, _, err := store.Create(callID, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "A")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,6 +530,9 @@ func TestCallViewExpiresAtUsesWholeSecondRFC3339WithoutChangingTimeout(t *testin
 	if !parsed.Equal(want) || !view.ExpiresAt.Equal(want) {
 		t.Fatalf("expiresAt = %s, want %s", wire.ExpiresAt, want.Format(time.RFC3339))
 	}
+	if !view.RingExpiresAt.Equal(base.Add(30 * time.Second)) {
+		t.Fatalf("precise ring deadline changed: %s", view.RingExpiresAt)
+	}
 
 	now = base.Add(30*time.Second - time.Nanosecond)
 	beforeExpiry, _ := store.Get(callID, "A")
@@ -378,6 +553,12 @@ func TestAcceptRejectCancelAndExpiration(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			srv, _, _ := fixture(t)
 			defer srv.Close()
+			registration := map[string]any{"requestID": "99999999-bbbb-4ccc-8ddd-eeeeeeeeeeee", "role": "B", "token": strings.Repeat("b", 64), "platform": "iOS", "pushType": "voip", "installationID": callID, "installationGeneration": 1, "environment": "production", "capabilities": map[string]bool{"voipPush": true, "microphoneReady": true}}
+			registered := request(t, srv.URL, "POST", "/v1/devices/register", tokenB, registration)
+			registered.Body.Close()
+			if registered.StatusCode != http.StatusNoContent {
+				t.Fatal(registered.StatusCode)
+			}
 			request(t, srv.URL, "POST", "/v1/calls", tokenA, createBody()).Body.Close()
 			resp := request(t, srv.URL, "POST", "/v1/calls/"+callID+"/"+tc.action, tc.token, mutationBody("bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"))
 			defer resp.Body.Close()
@@ -391,7 +572,7 @@ func TestAcceptRejectCancelAndExpiration(t *testing.T) {
 	store := calls.New(time.Second, 10*time.Second)
 	now := time.Now()
 	store.SetClock(func() time.Time { return now })
-	store.Create(callID, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "A")
+	_, _, _ = store.Create(callID, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "A")
 	now = now.Add(2 * time.Second)
 	view, _ := store.Get(callID, "A")
 	if view.State != calls.Expired {
@@ -400,16 +581,16 @@ func TestAcceptRejectCancelAndExpiration(t *testing.T) {
 }
 func TestAcceptCancelRaceHasOneWinner(t *testing.T) {
 	store := calls.New(30*time.Second, 10*time.Second)
-	store.Create(callID, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "A")
+	_, _, _ = store.Create(callID, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "A")
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		store.Mutate(callID, "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff", "B", calls.Accepted)
+		_, _, _ = store.Mutate(callID, "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff", "B", calls.Accepted)
 	}()
 	go func() {
 		defer wg.Done()
-		store.Mutate(callID, "cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa", "A", calls.Cancelled)
+		_, _, _ = store.Mutate(callID, "cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa", "A", calls.Cancelled)
 	}()
 	wg.Wait()
 	view, _ := store.Get(callID, "A")
@@ -430,8 +611,8 @@ func TestAcceptedMediaTokensRemainValidUntilTerminalState(t *testing.T) {
 	store := calls.New(30*time.Second, 10*time.Second)
 	now := time.Date(2026, time.September, 21, 3, 27, 24, 0, time.UTC)
 	store.SetClock(func() time.Time { return now })
-	store.Create(callID, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "A")
-	_, _ = store.Mutate(callID, "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff", "B", calls.Accepted)
+	_, _, _ = store.Create(callID, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "A")
+	_, _, _ = store.Mutate(callID, "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff", "B", calls.Accepted)
 	a, _ := store.Get(callID, "A")
 	b, _ := store.Get(callID, "B")
 	if !store.ValidateMedia(callID, "A", a.MediaToken) {
@@ -451,7 +632,7 @@ func TestAcceptedMediaTokensRemainValidUntilTerminalState(t *testing.T) {
 	if !store.ValidateMedia(callID, "A", a.MediaToken) || !store.ValidateMedia(callID, "B", b.MediaToken) {
 		t.Fatal("accepted call lost media authorization after old expiry plus grace")
 	}
-	_, _ = store.Mutate(callID, "cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa", "A", calls.Ended)
+	_, _, _ = store.Mutate(callID, "cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa", "A", calls.Ended)
 	if store.ValidateMedia(callID, "A", a.MediaToken) || store.ValidateMedia(callID, "B", b.MediaToken) {
 		t.Fatal("ended call authorized media")
 	}
@@ -463,12 +644,12 @@ func TestNonAcceptedStatesRejectMedia(t *testing.T) {
 			store := calls.New(30*time.Second, 10*time.Second)
 			now := time.Date(2026, time.September, 21, 3, 27, 24, 0, time.UTC)
 			store.SetClock(func() time.Time { return now })
-			_, _ = store.Create(callID, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "A")
+			_, _, _ = store.Create(callID, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "A")
 			switch target {
 			case calls.Rejected:
-				_, _ = store.Mutate(callID, "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff", "B", calls.Rejected)
+				_, _, _ = store.Mutate(callID, "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff", "B", calls.Rejected)
 			case calls.Cancelled:
-				_, _ = store.Mutate(callID, "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff", "A", calls.Cancelled)
+				_, _, _ = store.Mutate(callID, "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff", "A", calls.Cancelled)
 			case calls.Expired:
 				now = now.Add(30 * time.Second)
 				view, _ := store.Get(callID, "A")
@@ -485,8 +666,8 @@ func TestNonAcceptedStatesRejectMedia(t *testing.T) {
 func TestWebSocketRelayAndNoAudioPersistence(t *testing.T) {
 	srv, store, dir := fixture(t)
 	defer srv.Close()
-	store.Create(callID, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "A")
-	store.Mutate(callID, "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff", "B", calls.Accepted)
+	_, _, _ = store.Create(callID, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "A")
+	_, _, _ = store.Mutate(callID, "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff", "B", calls.Accepted)
 	a, _ := store.Get(callID, "A")
 	b, _ := store.Get(callID, "B")
 	base := "ws" + strings.TrimPrefix(srv.URL, "http") + "/media?callID=" + callID + "&role="

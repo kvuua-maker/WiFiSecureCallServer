@@ -5,8 +5,10 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -39,11 +41,31 @@ func New(tokenA, tokenB string, callStore *calls.Store, deviceStore *devices.Sto
 	return s
 }
 func (s *Server) Handler() http.Handler { return securityHeaders(s.mux) }
+func (s *Server) Shutdown()             { s.media.CloseAll("server restart") }
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "apnsConfigured": s.apns.Configured()})
+	_, a := s.devices.Get("A")
+	_, b := s.devices.Get("B")
+	readyA, readyB := false, false
+	if value, ok := s.devices.Get("A"); ok {
+		readyA = value.LiveReady()
+	}
+	if value, ok := s.devices.Get("B"); ok {
+		readyB = value.LiveReady()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "apnsConfigured": s.apns.Configured(), "build": buildIdentity(), "mediaReady": true, "roleAReady": a && readyA, "roleBReady": b && readyB})
 }
 
-type registerRequest struct{ RequestID, Role, Token, Platform, PushType string }
+type registerCapabilities struct {
+	VoIPPush                bool `json:"voipPush"`
+	AlertPush               bool `json:"alertPush"`
+	NotificationsAuthorized bool `json:"notificationsAuthorized"`
+	MicrophoneReady         bool `json:"microphoneReady"`
+}
+type registerRequest struct {
+	RequestID, Role, Token, InvalidatedToken, Platform, PushType, InstallationID, Environment string
+	InstallationGeneration                                                                    uint64
+	Capabilities                                                                              registerCapabilities
+}
 
 type notificationDiagnosticRequest struct {
 	RequestID, Role, Platform, Event, Status, TokenPrefix string
@@ -55,8 +77,8 @@ type notificationDiagnosticRequest struct {
 func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	role := roleFrom(r.Context())
 	var body registerRequest
-	if decode(r, &body) != nil {
-		writeError(w, http.StatusBadRequest, "invalid registration")
+	if err := decode(w, r, &body); err != nil {
+		writeDecodeError(w, err, "invalid registration")
 		return
 	}
 	if body.PushType == "" {
@@ -67,7 +89,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if body.Token == "" {
-		if err := s.devices.Invalidate(role, body.PushType); err != nil {
+		if err := s.devices.Invalidate(role, body.PushType, body.InstallationID, body.InstallationGeneration, body.InvalidatedToken); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid registration")
 			return
 		}
@@ -75,15 +97,11 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if err := s.devices.Register(role, body.Platform, body.PushType, body.Token); err != nil {
+	if err := s.devices.Register(role, body.Platform, body.PushType, body.Token, body.InstallationID, body.InstallationGeneration, body.Environment, devices.Capabilities{VoIPPush: body.Capabilities.VoIPPush, AlertPush: body.Capabilities.AlertPush, NotificationsAuthorized: body.Capabilities.NotificationsAuthorized, MicrophoneReady: body.Capabilities.MicrophoneReady}); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid registration")
 		return
 	}
-	prefix := body.Token
-	if len(prefix) > 8 {
-		prefix = prefix[:8]
-	}
-	slog.Info("APNs device registered", "role", role, "platform", body.Platform, "pushType", body.PushType, "tokenPrefix", prefix, "tokenLength", len(body.Token))
+	slog.Info("APNs device registered", "role", role, "platform", body.Platform, "pushType", body.PushType, "tokenLength", len(body.Token))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -131,8 +149,27 @@ func (s *Server) notificationDiagnostics(w http.ResponseWriter, r *http.Request)
 		"reconnect_started":                      true,
 		"reconnect_succeeded":                    true,
 		"reconnect_failed":                       true,
+		"incoming_callkit_reported":              true,
+		"incoming_reconcile_failed":              true,
+		"callkit_action_timeout":                 true,
+		"illegal_state_transition":               true,
+		"media_peer_ready":                       true,
+		"terminal_observer_failure":              true,
+		"terminal_mutation_failed":               true,
+		"mute_state_changed":                     true,
+		"audio_input_mute":                       true,
+		"audio_route":                            true,
+		"audio_route_changed":                    true,
+		"audio_interruption":                     true,
+		"capture_watchdog_failed":                true,
+		"first_playback_buffer_rendered":         true,
+		"playback_overflow":                      true,
 	}
-	if decode(r, &body) != nil || !validID(body.RequestID) || body.Role != role || !allowedEvents[body.Event] || len(body.Status) > 256 || len(body.TokenPrefix) > 8 || body.TokenLength < 0 || body.TokenLength > 512 || len(body.Stage) > 32 || len(body.ErrorDomain) > 128 || (body.CallID != "" && !validID(body.CallID)) {
+	if err := decode(w, r, &body); err != nil {
+		writeDecodeError(w, err, "invalid diagnostics")
+		return
+	}
+	if !validID(body.RequestID) || body.Role != role || !allowedEvents[body.Event] || len(body.Status) > 256 || len(body.TokenPrefix) > 8 || body.TokenLength < 0 || body.TokenLength > 512 || len(body.Stage) > 32 || len(body.ErrorDomain) > 128 || (body.CallID != "" && !validID(body.CallID)) {
 		writeError(w, http.StatusBadRequest, "invalid diagnostics")
 		return
 	}
@@ -166,42 +203,71 @@ type createRequest struct {
 
 func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	var body createRequest
-	if decode(r, &body) != nil || !validID(body.RequestID) || !validID(body.CallID) {
+	if err := decode(w, r, &body); err != nil {
+		writeDecodeError(w, err, "invalid request")
+		return
+	}
+	if !validID(body.RequestID) || !validID(body.CallID) {
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
-	view, err := s.calls.Create(strings.ToLower(body.CallID), body.RequestID, roleFrom(r.Context()))
+	view, createdNew, err := s.calls.Create(strings.ToLower(body.CallID), body.RequestID, roleFrom(r.Context()))
 	if err != nil {
 		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if !createdNew {
+		slog.Info("call create reconciled", "callID", view.CallID, "caller", view.Caller, "state", view.State)
+		writeJSON(w, http.StatusOK, view)
 		return
 	}
 	slog.Info("call created", "callID", view.CallID, "caller", view.Caller, "callee", view.Callee, "state", view.State)
 	if device, ok := s.devices.Get(view.Callee); ok {
 		pushType := "voip"
-		token := device.TokenFor(pushType)
+		token := device.TokenFor(pushType, "production")
 		if token == "" {
 			pushType = "alert"
-			token = device.TokenFor(pushType)
+			token = device.TokenFor(pushType, "production")
 		}
 		if token == "" {
 			slog.Warn("APNs delivery skipped", "callID", view.CallID, "role", view.Callee, "reason", "device_token_missing")
+			s.calls.FailDelivery(view.CallID, "device_token_missing")
 			writeJSON(w, http.StatusOK, view)
 			return
 		}
-		prefix := token
-		if len(prefix) > 8 {
-			prefix = prefix[:8]
-		}
-		slog.Info("APNs delivery attempted", "callID", view.CallID, "role", view.Callee, "platform", device.Platform, "pushType", pushType, "tokenPrefix", prefix, "tokenLength", len(token))
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-			defer cancel()
-			if err := s.apns.IncomingCall(ctx, view.Callee, token, view.CallID, pushType); err != nil {
-				slog.Warn("APNs delivery failed", "status", "delivery_failed")
+		slog.Info("APNs delivery attempted", "callID", view.CallID, "role", view.Callee, "platform", device.Platform, "pushType", pushType, "tokenLength", len(token))
+		go func(device devices.Registration, token, pushType string) {
+			if !s.calls.IsRinging(view.CallID) {
+				return
 			}
-		}()
+			deadline := view.RingExpiresAt
+			if deadline.IsZero() {
+				deadline = time.Now().Add(8 * time.Second)
+			}
+			if deadline.After(time.Now().Add(8 * time.Second)) {
+				deadline = time.Now().Add(8 * time.Second)
+			}
+			ctx, cancel := context.WithDeadline(context.Background(), deadline)
+			defer cancel()
+			result, err := s.apns.IncomingCall(ctx, view.Callee, token, view.CallID, pushType, view.RingExpiresAt)
+			if err != nil {
+				reason := result.Reason
+				if reason == "" {
+					reason = "unavailable"
+				}
+				s.calls.FailDelivery(view.CallID, reason)
+				slog.Warn("APNs submission failed", "callID", view.CallID, "status", result.Status, "reason", result.Reason)
+				if result.DeadToken {
+					_ = s.devices.Invalidate(view.Callee, pushType, device.InstallationID, device.InstallationGeneration, token)
+				}
+				return
+			}
+			s.calls.SetDelivery(view.CallID, "submission_accepted")
+			slog.Info("APNs submission accepted", "callID", view.CallID, "status", result.Status, "apnsID", result.APNSID)
+		}(device, token, pushType)
 	} else {
 		slog.Warn("APNs delivery skipped", "callID", view.CallID, "role", view.Callee, "reason", "device_token_missing")
+		s.calls.FailDelivery(view.CallID, "device_token_missing")
 	}
 	writeJSON(w, http.StatusOK, view)
 }
@@ -220,7 +286,11 @@ type mutationRequest struct {
 
 func (s *Server) mutate(w http.ResponseWriter, r *http.Request) {
 	var body mutationRequest
-	if decode(r, &body) != nil || !validID(body.RequestID) {
+	if err := decode(w, r, &body); err != nil {
+		writeDecodeError(w, err, "invalid request")
+		return
+	}
+	if !validID(body.RequestID) {
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
@@ -238,10 +308,13 @@ func (s *Server) mutate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "unknown action")
 		return
 	}
-	view, err := s.calls.Mutate(strings.ToLower(r.PathValue("id")), body.RequestID, roleFrom(r.Context()), target)
+	view, _, err := s.calls.Mutate(strings.ToLower(r.PathValue("id")), body.RequestID, roleFrom(r.Context()), target)
 	if err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
+	}
+	if view.State == calls.Ended || view.State == calls.Cancelled || view.State == calls.Rejected || view.State == calls.Expired {
+		s.media.CloseCall(view.CallID, string(view.State))
 	}
 	writeJSON(w, http.StatusOK, view)
 }
@@ -252,7 +325,12 @@ const roleKey contextKey = "role"
 
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		header := r.Header.Get("Authorization")
+		if !strings.HasPrefix(header, "Bearer ") || strings.Count(header, " ") != 1 {
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		token := strings.TrimPrefix(header, "Bearer ")
 		role := ""
 		if subtle.ConstantTimeCompare([]byte(token), []byte(s.tokenA)) == 1 {
 			role = "A"
@@ -268,11 +346,28 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 func roleFrom(ctx context.Context) string { value, _ := ctx.Value(roleKey).(string); return value }
-func decode(r *http.Request, value any) error {
-	r.Body = http.MaxBytesReader(nil, r.Body, 4096)
+func decode(w http.ResponseWriter, r *http.Request, value any) error {
+	if r.ContentLength > 4096 {
+		return &http.MaxBytesError{Limit: 4096}
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
-	return decoder.Decode(value)
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return errors.New("trailing data")
+	}
+	return nil
+}
+func writeDecodeError(w http.ResponseWriter, err error, message string) {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		writeError(w, http.StatusRequestEntityTooLarge, "payload too large")
+		return
+	}
+	writeError(w, http.StatusBadRequest, message)
 }
 func validID(value string) bool {
 	if len(value) != 36 {
@@ -308,3 +403,10 @@ func securityHeaders(next http.Handler) http.Handler {
 }
 
 var _ = errors.New
+
+func buildIdentity() string {
+	if value := strings.TrimSpace(os.Getenv("WSC_BUILD")); value != "" {
+		return value
+	}
+	return "development"
+}
