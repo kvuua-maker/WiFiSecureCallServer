@@ -2,10 +2,13 @@ package media
 
 import (
 	"encoding/binary"
+	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/gorilla/websocket"
 )
@@ -22,6 +25,16 @@ type Hub struct {
 type peer struct {
 	conn *websocket.Conn
 	mu   sync.Mutex
+}
+
+type connectionStats struct {
+	binaryMessages    uint64
+	validAudioPackets uint64
+	invalidPackets    uint64
+	audioBytes        uint64
+	relayedPackets    uint64
+	relayFailures     uint64
+	peerMissingCount  uint64
 }
 
 func New(validator Validator) *Hub {
@@ -41,28 +54,85 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := &peer{conn: conn}
-	h.add(id, role, p)
-	defer func() { h.remove(id, role, p); conn.Close() }()
+	started := time.Now()
+	secondPeerPresent := h.add(id, role, p)
+	slog.Info("media joined", "callID", id, "role", role)
+	if secondPeerPresent {
+		slog.Info("media peers paired", "callID", id, "roles", "A,B")
+	}
+	stats := connectionStats{}
+	closeCode := 0
+	closeReason := ""
+	defer func() {
+		h.remove(id, role, p)
+		conn.Close()
+		slog.Info(
+			"media disconnected",
+			"callID", id,
+			"role", role,
+			"durationMilliseconds", time.Since(started).Milliseconds(),
+			"binaryMessages", stats.binaryMessages,
+			"validAudioPackets", stats.validAudioPackets,
+			"audioBytes", stats.audioBytes,
+			"invalidPackets", stats.invalidPackets,
+			"relayedPackets", stats.relayedPackets,
+			"relayFailures", stats.relayFailures,
+			"peerMissingCount", stats.peerMissingCount,
+			"closeCode", closeCode,
+			"closeReason", closeReason,
+		)
+	}()
 	conn.SetReadLimit(2048)
+	firstAudioLogged := false
 	for {
 		kind, data, err := conn.ReadMessage()
 		if err != nil {
+			var closeError *websocket.CloseError
+			if errors.As(err, &closeError) {
+				closeCode = closeError.Code
+				closeReason = sanitizeCloseReason(closeError.Text)
+			}
 			return
 		}
-		if kind != websocket.BinaryMessage || !validPacket(data, id) {
+		if kind != websocket.BinaryMessage {
+			stats.invalidPackets++
 			continue
+		}
+		stats.binaryMessages++
+		if !validPacket(data, id) {
+			stats.invalidPackets++
+			continue
+		}
+		if data[1] == 1 {
+			stats.validAudioPackets++
+			stats.audioBytes += uint64(len(data) - 34)
+			if !firstAudioLogged {
+				firstAudioLogged = true
+				slog.Info(
+					"first valid audio packet received",
+					"callID", id,
+					"role", role,
+					"packetByteLength", len(data),
+					"sequence", binary.BigEndian.Uint64(data[18:26]),
+					"packetTimestampMicroseconds", binary.BigEndian.Uint64(data[26:34]),
+				)
+			}
 		}
 		if destination := h.other(id, role); destination != nil {
 			destination.mu.Lock()
 			err = destination.conn.WriteMessage(websocket.BinaryMessage, data)
 			destination.mu.Unlock()
 			if err != nil {
+				stats.relayFailures++
 				continue
 			}
+			stats.relayedPackets++
+		} else {
+			stats.peerMissingCount++
 		}
 	}
 }
-func (h *Hub) add(id, role string, p *peer) {
+func (h *Hub) add(id, role string, p *peer) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.peers[id] == nil {
@@ -72,6 +142,11 @@ func (h *Hub) add(id, role string, p *peer) {
 		old.conn.Close()
 	}
 	h.peers[id][role] = p
+	otherRole := "A"
+	if role == "A" {
+		otherRole = "B"
+	}
+	return h.peers[id][otherRole] != nil
 }
 func (h *Hub) remove(id, role string, p *peer) {
 	h.mu.Lock()
@@ -101,6 +176,19 @@ func validPacket(data []byte, id string) bool {
 	}
 	_ = binary.BigEndian.Uint64(data[18:26])
 	return uuidString(data[2:18]) == strings.ToLower(id)
+}
+
+func sanitizeCloseReason(value string) string {
+	value = strings.Map(func(r rune) rune {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.IsSpace(r) || strings.ContainsRune("-_.:/", r) {
+			return r
+		}
+		return -1
+	}, value)
+	if len(value) > 64 {
+		value = value[:64]
+	}
+	return value
 }
 func uuidString(b []byte) string {
 	if len(b) != 16 {

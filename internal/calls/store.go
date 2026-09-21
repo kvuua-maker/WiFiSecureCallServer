@@ -130,7 +130,7 @@ func (s *Store) ValidateMedia(id, role, token string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	call, ok := s.calls[id]
-	if !ok || call.State != Accepted || s.now().After(call.ExpiresAt.Add(s.mediaGrace)) {
+	if !ok || call.State != Accepted {
 		return false
 	}
 	want := call.tokenA

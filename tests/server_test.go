@@ -344,22 +344,60 @@ func TestInvalidBearerToken(t *testing.T) {
 		t.Fatal(resp.StatusCode)
 	}
 }
-func TestMediaTokenBindingWrongRoleAndExpiry(t *testing.T) {
+func TestAcceptedMediaTokensRemainValidUntilTerminalState(t *testing.T) {
 	store := calls.New(30*time.Second, 10*time.Second)
-	now := time.Now()
+	now := time.Date(2026, time.September, 21, 3, 27, 24, 0, time.UTC)
 	store.SetClock(func() time.Time { return now })
 	store.Create(callID, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "A")
-	accepted, _ := store.Mutate(callID, "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff", "B", calls.Accepted)
+	_, _ = store.Mutate(callID, "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff", "B", calls.Accepted)
 	a, _ := store.Get(callID, "A")
-	if !store.ValidateMedia(callID, "A", a.MediaToken) || store.ValidateMedia(callID, "B", a.MediaToken) || store.ValidateMedia("bad", "A", a.MediaToken) {
-		t.Fatal("media binding failed")
+	b, _ := store.Get(callID, "B")
+	if !store.ValidateMedia(callID, "A", a.MediaToken) {
+		t.Fatal("correct A token rejected")
 	}
-	if accepted.MediaToken == a.MediaToken {
-		t.Fatal("role tokens must differ")
+	if !store.ValidateMedia(callID, "B", b.MediaToken) {
+		t.Fatal("correct B token rejected")
 	}
+	if store.ValidateMedia(callID, "B", a.MediaToken) || store.ValidateMedia(callID, "A", b.MediaToken) {
+		t.Fatal("role token isolation failed")
+	}
+	if store.ValidateMedia(callID, "A", "wrong-token") || store.ValidateMedia("bad", "A", a.MediaToken) {
+		t.Fatal("wrong token or call ID accepted")
+	}
+
 	now = now.Add(41 * time.Second)
-	if store.ValidateMedia(callID, "A", a.MediaToken) {
-		t.Fatal("expired token accepted")
+	if !store.ValidateMedia(callID, "A", a.MediaToken) || !store.ValidateMedia(callID, "B", b.MediaToken) {
+		t.Fatal("accepted call lost media authorization after old expiry plus grace")
+	}
+	_, _ = store.Mutate(callID, "cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa", "A", calls.Ended)
+	if store.ValidateMedia(callID, "A", a.MediaToken) || store.ValidateMedia(callID, "B", b.MediaToken) {
+		t.Fatal("ended call authorized media")
+	}
+}
+
+func TestNonAcceptedStatesRejectMedia(t *testing.T) {
+	for _, target := range []calls.State{calls.Rejected, calls.Cancelled, calls.Expired} {
+		t.Run(string(target), func(t *testing.T) {
+			store := calls.New(30*time.Second, 10*time.Second)
+			now := time.Date(2026, time.September, 21, 3, 27, 24, 0, time.UTC)
+			store.SetClock(func() time.Time { return now })
+			_, _ = store.Create(callID, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "A")
+			switch target {
+			case calls.Rejected:
+				_, _ = store.Mutate(callID, "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff", "B", calls.Rejected)
+			case calls.Cancelled:
+				_, _ = store.Mutate(callID, "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff", "A", calls.Cancelled)
+			case calls.Expired:
+				now = now.Add(30 * time.Second)
+				view, _ := store.Get(callID, "A")
+				if view.State != calls.Expired {
+					t.Fatalf("ringing timeout not preserved: %s", view.State)
+				}
+			}
+			if store.ValidateMedia(callID, "A", "any-token") || store.ValidateMedia(callID, "B", "any-token") {
+				t.Fatalf("%s call authorized media", target)
+			}
+		})
 	}
 }
 func TestWebSocketRelayAndNoAudioPersistence(t *testing.T) {
@@ -396,7 +434,24 @@ func TestWebSocketRelayAndNoAudioPersistence(t *testing.T) {
 	connB.SetReadDeadline(time.Now().Add(time.Second))
 	kind, got, err := connB.ReadMessage()
 	if err != nil || kind != websocket.BinaryMessage || !bytes.Equal(got, packet) {
-		t.Fatal("relay failed")
+		t.Fatal("A to B relay failed")
+	}
+	if err := connB.WriteMessage(websocket.BinaryMessage, packet); err != nil {
+		t.Fatal(err)
+	}
+	connA.SetReadDeadline(time.Now().Add(time.Second))
+	kind, got, err = connA.ReadMessage()
+	if err != nil || kind != websocket.BinaryMessage || !bytes.Equal(got, packet) {
+		t.Fatal("B to A relay failed")
+	}
+	invalid := append([]byte(nil), packet...)
+	invalid[2] ^= 0xff
+	if err := connA.WriteMessage(websocket.BinaryMessage, invalid); err != nil {
+		t.Fatal(err)
+	}
+	connB.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	if _, _, err := connB.ReadMessage(); err == nil {
+		t.Fatal("invalid packet was relayed")
 	}
 	entries, _ := os.ReadDir(dir)
 	for _, entry := range entries {
