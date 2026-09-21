@@ -226,6 +226,69 @@ func TestCallKitErrorDiagnosticIsAcceptedAndBounded(t *testing.T) {
 	}
 	bad.Body.Close()
 }
+
+func TestRuntimeAudioDiagnosticsAreAcceptedAndBounded(t *testing.T) {
+	srv, _, _ := fixture(t)
+	defer srv.Close()
+	base := map[string]any{
+		"requestID": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+		"role":      "B", "platform": "iOS", "callID": callID,
+	}
+	for _, event := range []string{
+		"audio_session_configured", "callkit_did_activate", "callkit_did_deactivate",
+		"audio_engine_start_attempt", "audio_engine_start_success", "voice_processing_enabled",
+		"input_format", "output_format", "first_mic_buffer",
+		"first_network_audio_frame_generated", "first_network_audio_frame_sent",
+		"first_remote_audio_frame_received", "first_playback_buffer_scheduled",
+		"media_connect_started", "media_connect_succeeded", "media_disconnected",
+		"reconnect_started", "reconnect_succeeded", "reconnect_failed",
+	} {
+		body := make(map[string]any, len(base)+2)
+		for key, value := range base {
+			body[key] = value
+		}
+		body["event"] = event
+		body["status"] = "success"
+		resp := request(t, srv.URL, "POST", "/v1/devices/diagnostics", tokenB, body)
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("event %s: %d", event, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+
+	bad := map[string]any{
+		"requestID": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "role": "B", "platform": "iOS",
+		"callID": "not-a-uuid", "event": "audio_engine_start_success", "status": "success",
+	}
+	resp := request(t, srv.URL, "POST", "/v1/devices/diagnostics", tokenB, bad)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatal(resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	bad["callID"] = callID
+	bad["status"] = strings.Repeat("x", 257)
+	resp = request(t, srv.URL, "POST", "/v1/devices/diagnostics", tokenB, bad)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatal(resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestRuntimeDiagnosticRejectsSecretAndAudioPayloadFields(t *testing.T) {
+	srv, _, _ := fixture(t)
+	defer srv.Close()
+	body := map[string]any{
+		"requestID": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "role": "B", "platform": "iOS",
+		"callID": callID, "event": "first_network_audio_frame_sent", "status": "bytes=640",
+		"mediaToken": "must-not-be-accepted", "audioPayload": "must-not-be-accepted",
+	}
+	resp := request(t, srv.URL, "POST", "/v1/devices/diagnostics", tokenB, body)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatal(resp.StatusCode)
+	}
+	resp.Body.Close()
+}
 func TestCreateAndIdempotentCreate(t *testing.T) {
 	srv, _, _ := fixture(t)
 	defer srv.Close()

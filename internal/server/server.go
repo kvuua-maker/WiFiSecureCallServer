@@ -48,6 +48,7 @@ type registerRequest struct{ RequestID, Role, Token, Platform, PushType string }
 type notificationDiagnosticRequest struct {
 	RequestID, Role, Platform, Event, Status, TokenPrefix string
 	Stage, ErrorDomain                                    string
+	CallID                                                string
 	TokenLength, ErrorCode                                int
 }
 
@@ -90,13 +91,35 @@ func (s *Server) notificationDiagnostics(w http.ResponseWriter, r *http.Request)
 	role := roleFrom(r.Context())
 	var body notificationDiagnosticRequest
 	allowedEvents := map[string]bool{
-		"notification_permission":     true,
-		"apns_registration_started":   true,
-		"apns_registration_succeeded": true,
-		"apns_registration_failed":    true,
-		"callkit_error":               true,
+		"notification_permission":             true,
+		"apns_registration_started":           true,
+		"apns_registration_succeeded":         true,
+		"apns_registration_failed":            true,
+		"callkit_error":                       true,
+		"audio_session_configured":            true,
+		"callkit_did_activate":                true,
+		"callkit_did_deactivate":              true,
+		"audio_engine_start_attempt":          true,
+		"audio_engine_start_success":          true,
+		"audio_engine_start_failure":          true,
+		"voice_processing_enabled":            true,
+		"input_format":                        true,
+		"output_format":                       true,
+		"first_mic_buffer":                    true,
+		"first_network_audio_frame_generated": true,
+		"first_network_audio_frame_sent":      true,
+		"first_remote_audio_frame_received":   true,
+		"first_playback_buffer_scheduled":     true,
+		"first_playback_failure":              true,
+		"media_connect_started":               true,
+		"media_connect_succeeded":             true,
+		"media_connect_failed":                true,
+		"media_disconnected":                  true,
+		"reconnect_started":                   true,
+		"reconnect_succeeded":                 true,
+		"reconnect_failed":                    true,
 	}
-	if decode(r, &body) != nil || !validID(body.RequestID) || body.Role != role || !allowedEvents[body.Event] || len(body.Status) > 128 || len(body.TokenPrefix) > 8 || body.TokenLength < 0 || body.TokenLength > 512 || len(body.Stage) > 32 || len(body.ErrorDomain) > 128 {
+	if decode(r, &body) != nil || !validID(body.RequestID) || body.Role != role || !allowedEvents[body.Event] || len(body.Status) > 256 || len(body.TokenPrefix) > 8 || body.TokenLength < 0 || body.TokenLength > 512 || len(body.Stage) > 32 || len(body.ErrorDomain) > 128 || (body.CallID != "" && !validID(body.CallID)) {
 		writeError(w, http.StatusBadRequest, "invalid diagnostics")
 		return
 	}
@@ -104,12 +127,18 @@ func (s *Server) notificationDiagnostics(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "invalid diagnostics")
 		return
 	}
-	if body.Event != "callkit_error" && (body.Stage != "" || body.ErrorDomain != "" || body.ErrorCode != 0) {
+	errorEvent := body.Event == "callkit_error" || body.Event == "voice_processing_enabled" || body.Event == "audio_engine_start_failure" || body.Event == "first_playback_failure" || body.Event == "media_connect_failed" || body.Event == "media_disconnected"
+	if !errorEvent && (body.Stage != "" || body.ErrorDomain != "" || body.ErrorCode != 0) {
 		writeError(w, http.StatusBadRequest, "invalid diagnostics")
 		return
 	}
 	if body.Event == "callkit_error" {
-		slog.Warn("CallKit error diagnostic", "role", role, "platform", body.Platform, "stage", body.Stage, "domain", body.ErrorDomain, "code", body.ErrorCode)
+		slog.Warn("CallKit error diagnostic", "role", role, "platform", body.Platform, "callID", body.CallID, "stage", body.Stage, "domain", body.ErrorDomain, "code", body.ErrorCode)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if body.Event != "notification_permission" && body.Event != "apns_registration_started" && body.Event != "apns_registration_succeeded" && body.Event != "apns_registration_failed" {
+		slog.Info("runtime diagnostic", "role", role, "platform", body.Platform, "callID", body.CallID, "event", body.Event, "status", body.Status, "domain", body.ErrorDomain, "code", body.ErrorCode)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
