@@ -102,6 +102,9 @@ func (c *Client) incomingCall(ctx context.Context, role, deviceToken, callID, pu
 		},
 		"callID": callID, "serverCallID": callID, "event": "incoming_call",
 	}
+	if role == "A" && pushType == "alert" {
+		bodyValue["aps"].(map[string]any)["content-available"] = 1
+	}
 	if pushType == "voip" {
 		expiration = 0
 		bodyValue = map[string]any{

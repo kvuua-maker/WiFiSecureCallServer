@@ -362,6 +362,47 @@ func TestNotificationDiagnosticsAuthAndValidation(t *testing.T) {
 	bad.Body.Close()
 }
 
+func TestWatchBackgroundDiagnosticEventsAreExactAndBounded(t *testing.T) {
+	srv, _, _ := fixture(t)
+	defer srv.Close()
+	events := []string{
+		"watch_background_notification_received",
+		"watch_background_callkit_handoff",
+		"duplicate_incoming_suppressed",
+		"watch_alert_action_received",
+		"watch_notification_capabilities_refreshed",
+	}
+	for _, event := range events {
+		body := map[string]any{
+			"requestID": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+			"role":      "A",
+			"platform":  "watchOS",
+			"event":     event,
+			"status":    "success",
+			"callID":    "11111111-2222-4333-8444-555555555555",
+		}
+		resp := request(t, srv.URL, "POST", "/v1/devices/diagnostics", tokenA, body)
+		if resp.StatusCode != http.StatusNoContent {
+			resp.Body.Close()
+			t.Fatalf("event %s status %d", event, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+	unknown := map[string]any{
+		"requestID": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+		"role":      "A",
+		"platform":  "watchOS",
+		"event":     "watch_background_unknown",
+		"status":    "success",
+	}
+	resp := request(t, srv.URL, "POST", "/v1/devices/diagnostics", tokenA, unknown)
+	if resp.StatusCode != http.StatusBadRequest {
+		resp.Body.Close()
+		t.Fatalf("unknown event status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
 func TestCallKitErrorDiagnosticIsAcceptedAndBounded(t *testing.T) {
 	srv, _, _ := fixture(t)
 	defer srv.Close()
