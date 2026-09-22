@@ -3,16 +3,19 @@ package config
 import (
 	"errors"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
 
 type Config struct {
-	Address, StatePath, TokenA, TokenB                                 string
-	APNSEnabled                                                        bool
-	APNSTeamID, APNSKeyID, APNSKeyPath                                 string
-	APNSTopicIOS, APNSTopicWatch, APNSTopicIOSVoIP, APNSTopicWatchVoIP string
-	RingTimeout                                                        time.Duration
+	Address, StatePath, TokenA, TokenB                                        string
+	APNSEnabled                                                               bool
+	APNSTeamID, APNSKeyID, APNSKeyPath                                        string
+	APNSTopicIOS, APNSTopicWatch, APNSTopicIOSVoIP, APNSTopicWatchVoIP        string
+	RingTimeout                                                               time.Duration
+	SMSProvider, SMSClubToken, SMSClubOriginator, AccountStatePath, OTPPepper string
+	SMSMaxSendsPerDay                                                         int
 }
 
 func Load() (Config, error) {
@@ -22,13 +25,26 @@ func Load() (Config, error) {
 		APNSTeamID: os.Getenv("APNS_TEAM_ID"), APNSKeyID: os.Getenv("APNS_KEY_ID"), APNSKeyPath: os.Getenv("APNS_KEY_PATH"),
 		APNSTopicIOS: getenv("APNS_TOPIC_IOS", "com.vkapps.wifisecurecall"), APNSTopicWatch: getenv("APNS_TOPIC_WATCH", "com.vkapps.wifisecurecall.watchkitapp"),
 		APNSTopicIOSVoIP: getenv("APNS_TOPIC_IOS_VOIP", "com.vkapps.wifisecurecall.voip"), APNSTopicWatchVoIP: getenv("APNS_TOPIC_WATCH_VOIP", "com.vkapps.wifisecurecall.watchkitapp.voip"),
-		RingTimeout: 30 * time.Second,
+		RingTimeout:  30 * time.Second,
+		SMSProvider:  getenv("SMS_PROVIDER", "disabled"),
+		SMSClubToken: os.Getenv("SMSCLUB_TOKEN"), SMSClubOriginator: os.Getenv("SMSCLUB_ORIGINATOR"),
+		AccountStatePath: getenv("WSC_ACCOUNT_STATE_PATH", "/opt/wifi-secure-call/state/accounts.json"),
+		OTPPepper:        os.Getenv("WSC_OTP_PEPPER"),
+	}
+	if raw := os.Getenv("SMS_MAX_SENDS_PER_DAY"); raw != "" {
+		c.SMSMaxSendsPerDay, _ = strconv.Atoi(raw)
 	}
 	if len(c.TokenA) < 32 || len(c.TokenB) < 32 || c.TokenA == c.TokenB || strings.ContainsAny(c.TokenA+c.TokenB, " \t\r\n") {
 		return Config{}, errors.New("distinct WSC_TOKEN_A and WSC_TOKEN_B are required")
 	}
 	if c.APNSEnabled && (c.APNSTeamID == "" || c.APNSKeyID == "" || c.APNSKeyPath == "") {
 		return Config{}, errors.New("APNs enabled but key configuration is incomplete")
+	}
+	if c.SMSProvider != "disabled" && c.SMSProvider != "smsclub" {
+		return Config{}, errors.New("invalid SMS_PROVIDER")
+	}
+	if c.SMSProvider == "smsclub" && (c.SMSClubToken == "" || c.SMSClubOriginator == "" || len(c.OTPPepper) < 32 || c.SMSMaxSendsPerDay <= 0) {
+		return Config{}, errors.New("SMSClub configuration is incomplete")
 	}
 	return c, nil
 }

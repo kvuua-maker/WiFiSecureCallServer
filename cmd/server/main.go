@@ -9,11 +9,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/accounts"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/apns"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/calls"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/config"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/devices"
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/phoneauth"
 	appserver "github.com/kvuua-maker/wifi-secure-call-server/internal/server"
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/smsclub"
 )
 
 func main() {
@@ -42,6 +45,19 @@ func main() {
 	}
 	callStore := calls.New(cfg.RingTimeout, 0)
 	server := appserver.New(cfg.TokenA, cfg.TokenB, callStore, deviceStore, push)
+	if cfg.SMSProvider == "smsclub" {
+		accountStore, e := accounts.Open(cfg.AccountStatePath)
+		if e != nil {
+			slog.Error("account state failed", "error", e)
+			os.Exit(1)
+		}
+		auth, e := phoneauth.New(accountStore, smsclub.New(cfg.SMSClubToken, cfg.SMSClubOriginator), cfg.OTPPepper, cfg.SMSMaxSendsPerDay)
+		if e != nil {
+			slog.Error("phone authentication configuration failed", "error", e)
+			os.Exit(1)
+		}
+		server = appserver.NewWithV2(cfg.TokenA, cfg.TokenB, callStore, deviceStore, push, auth)
+	}
 	httpServer := &http.Server{Addr: cfg.Address, Handler: server.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 8192}
 	slog.Info("wifi-secure-call listening", "address", cfg.Address, "apnsConfigured", push.Configured())
 	errCh := make(chan error, 1)

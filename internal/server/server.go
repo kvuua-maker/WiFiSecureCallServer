@@ -16,6 +16,7 @@ import (
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/calls"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/devices"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/media"
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/phoneauth"
 )
 
 type Server struct {
@@ -25,10 +26,15 @@ type Server struct {
 	apns           apns.Sender
 	media          *media.Hub
 	mux            *http.ServeMux
+	phoneAuth      *phoneauth.Service
 }
 
 func New(tokenA, tokenB string, callStore *calls.Store, deviceStore *devices.Store, push apns.Sender) *Server {
-	s := &Server{tokenA: tokenA, tokenB: tokenB, calls: callStore, devices: deviceStore, apns: push}
+	return NewWithV2(tokenA, tokenB, callStore, deviceStore, push, nil)
+}
+
+func NewWithV2(tokenA, tokenB string, callStore *calls.Store, deviceStore *devices.Store, push apns.Sender, auth *phoneauth.Service) *Server {
+	s := &Server{tokenA: tokenA, tokenB: tokenB, calls: callStore, devices: deviceStore, apns: push, phoneAuth: auth}
 	s.media = media.New(callStore)
 	s.mux = http.NewServeMux()
 	s.mux.HandleFunc("GET /v1/health", s.health)
@@ -38,6 +44,7 @@ func New(tokenA, tokenB string, callStore *calls.Store, deviceStore *devices.Sto
 	s.mux.HandleFunc("GET /v1/calls/{id}", s.auth(s.get))
 	s.mux.HandleFunc("POST /v1/calls/{id}/{action}", s.auth(s.mutate))
 	s.mux.Handle("/media", s.media)
+	s.registerV2()
 	return s
 }
 func (s *Server) Handler() http.Handler { return securityHeaders(s.mux) }
