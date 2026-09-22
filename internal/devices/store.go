@@ -188,7 +188,14 @@ func (r Registration) TokenFor(pushType, environment string) string {
 	return r.Token
 }
 func (r Registration) LiveReady() bool {
-	return r.VoIPToken != "" && r.Capabilities.VoIPPush && r.Capabilities.MicrophoneReady
+	switch r.Platform {
+	case "watchOS":
+		return r.AlertToken != "" && r.Capabilities.AlertPush && r.Capabilities.NotificationsAuthorized && r.Capabilities.MicrophoneReady
+	case "iOS":
+		return r.VoIPToken != "" && r.Capabilities.VoIPPush && r.Capabilities.MicrophoneReady
+	default:
+		return false
+	}
 }
 func (s *Store) Get(role string) (Registration, bool) {
 	s.mu.RLock()

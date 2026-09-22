@@ -185,7 +185,7 @@ func TestAlertAndVoIPTokensCoexistWithoutCrossRoleOverwrite(t *testing.T) {
 	}
 }
 
-func TestLiveCallPrefersCalleeVoIPToken(t *testing.T) {
+func TestIPhoneIncomingPrefersVoIPToken(t *testing.T) {
 	dir := t.TempDir()
 	deviceStore, err := devices.Open(filepath.Join(dir, "devices.json"))
 	if err != nil {
@@ -211,6 +211,130 @@ func TestLiveCallPrefersCalleeVoIPToken(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("push not attempted")
+	}
+	select {
+	case attempt := <-recorder.attempts:
+		t.Fatalf("unexpected duplicate push attempt: %+v", attempt)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestWatchIncomingPrefersAlertToken(t *testing.T) {
+	deviceStore, err := devices.Open(filepath.Join(t.TempDir(), "devices.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	aAlert, aVoIP := strings.Repeat("a", 64), strings.Repeat("c", 64)
+	caps := devices.Capabilities{VoIPPush: true, AlertPush: true, NotificationsAuthorized: true, MicrophoneReady: true}
+	if err := deviceStore.Register("A", "watchOS", "alert", aAlert, callID, 1, "production", caps); err != nil {
+		t.Fatal(err)
+	}
+	if err := deviceStore.Register("A", "watchOS", "voip", aVoIP, callID, 1, "production", caps); err != nil {
+		t.Fatal(err)
+	}
+	recorder := &pushRecorder{attempts: make(chan pushAttempt, 2)}
+	srv := httptest.NewServer(appserver.New(tokenA, tokenB, calls.New(30*time.Second, 10*time.Second), deviceStore, recorder).Handler())
+	defer srv.Close()
+	resp := request(t, srv.URL, "POST", "/v1/calls", tokenB, createBody())
+	resp.Body.Close()
+	select {
+	case attempt := <-recorder.attempts:
+		if attempt.role != "A" || attempt.token != aAlert || attempt.pushType != "alert" || attempt.callID != callID {
+			t.Fatalf("unexpected push attempt: %+v", attempt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("push not attempted")
+	}
+	select {
+	case attempt := <-recorder.attempts:
+		t.Fatalf("unexpected duplicate push attempt: %+v", attempt)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestWatchIncomingFallsBackToVoIPWhenAlertMissing(t *testing.T) {
+	deviceStore, err := devices.Open(filepath.Join(t.TempDir(), "devices.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	aVoIP := strings.Repeat("c", 64)
+	caps := devices.Capabilities{VoIPPush: true, AlertPush: true, NotificationsAuthorized: true, MicrophoneReady: true}
+	if err := deviceStore.Register("A", "watchOS", "voip", aVoIP, callID, 1, "production", caps); err != nil {
+		t.Fatal(err)
+	}
+	recorder := &pushRecorder{attempts: make(chan pushAttempt, 2)}
+	srv := httptest.NewServer(appserver.New(tokenA, tokenB, calls.New(30*time.Second, 10*time.Second), deviceStore, recorder).Handler())
+	defer srv.Close()
+	resp := request(t, srv.URL, "POST", "/v1/calls", tokenB, createBody())
+	resp.Body.Close()
+	select {
+	case attempt := <-recorder.attempts:
+		if attempt.role != "A" || attempt.token != aVoIP || attempt.pushType != "voip" || attempt.callID != callID {
+			t.Fatalf("unexpected push attempt: %+v", attempt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("push not attempted")
+	}
+	select {
+	case attempt := <-recorder.attempts:
+		t.Fatalf("unexpected duplicate push attempt: %+v", attempt)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestWatchLiveReadyUsesAlertPath(t *testing.T) {
+	base := devices.Registration{
+		Role:       "A",
+		Platform:   "watchOS",
+		AlertToken: strings.Repeat("a", 64),
+		VoIPToken:  strings.Repeat("c", 64),
+		Capabilities: devices.Capabilities{
+			AlertPush:               true,
+			VoIPPush:                true,
+			NotificationsAuthorized: true,
+			MicrophoneReady:         true,
+		},
+	}
+	if !base.LiveReady() {
+		t.Fatal("complete Watch alert path is not ready")
+	}
+	missingToken := base
+	missingToken.AlertToken = ""
+	if missingToken.LiveReady() {
+		t.Fatal("Watch without alert token reported ready")
+	}
+	unauthorized := base
+	unauthorized.Capabilities.NotificationsAuthorized = false
+	if unauthorized.LiveReady() {
+		t.Fatal("Watch without notification authorization reported ready")
+	}
+}
+
+func TestIOSLiveReadyStillUsesVoIPPath(t *testing.T) {
+	base := devices.Registration{
+		Role:       "B",
+		Platform:   "iOS",
+		AlertToken: strings.Repeat("d", 64),
+		VoIPToken:  strings.Repeat("b", 64),
+		Capabilities: devices.Capabilities{
+			AlertPush:               true,
+			VoIPPush:                true,
+			NotificationsAuthorized: false,
+			MicrophoneReady:         true,
+		},
+	}
+	if !base.LiveReady() {
+		t.Fatal("complete iOS VoIP path is not ready")
+	}
+	missingToken := base
+	missingToken.VoIPToken = ""
+	if missingToken.LiveReady() {
+		t.Fatal("iOS without VoIP token reported ready")
+	}
+	missingCapability := base
+	missingCapability.Capabilities.VoIPPush = false
+	if missingCapability.LiveReady() {
+		t.Fatal("iOS without VoIP capability reported ready")
 	}
 }
 func TestNotificationDiagnosticsAuthAndValidation(t *testing.T) {

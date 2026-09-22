@@ -223,12 +223,7 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("call created", "callID", view.CallID, "caller", view.Caller, "callee", view.Callee, "state", view.State)
 	if device, ok := s.devices.Get(view.Callee); ok {
-		pushType := "voip"
-		token := device.TokenFor(pushType, "production")
-		if token == "" {
-			pushType = "alert"
-			token = device.TokenFor(pushType, "production")
-		}
+		token, pushType := selectIncomingPush(device, view.Callee)
 		if token == "" {
 			slog.Warn("APNs delivery skipped", "callID", view.CallID, "role", view.Callee, "reason", "device_token_missing")
 			s.calls.FailDelivery(view.CallID, "device_token_missing")
@@ -271,6 +266,20 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, view)
 }
+
+func selectIncomingPush(device devices.Registration, calleeRole string) (token, pushType string) {
+	preferred := []string{"voip", "alert"}
+	if calleeRole == "A" && device.Platform == "watchOS" {
+		preferred = []string{"alert", "voip"}
+	}
+	for _, candidate := range preferred {
+		if token := device.TokenFor(candidate, "production"); token != "" {
+			return token, candidate
+		}
+	}
+	return "", preferred[0]
+}
+
 func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 	view, err := s.calls.Get(strings.ToLower(r.PathValue("id")), roleFrom(r.Context()))
 	if err != nil {
