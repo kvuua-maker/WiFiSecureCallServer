@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/apns"
@@ -26,37 +25,10 @@ type Server struct {
 	apns           apns.Sender
 	media          *media.Hub
 	mux            *http.ServeMux
-	watchAckGrace  time.Duration
-	watchAckMu     sync.Mutex
-	watchAcks      map[string]*watchIncomingAttempt
 }
 
-type watchIncomingAttempt struct {
-	acknowledged   bool
-	resolved       bool
-	acknowledgedCh chan struct{}
-}
-
-type Option func(*Server)
-
-func WithWatchVoIPAckGraceForTesting(grace time.Duration) Option {
-	return func(s *Server) {
-		if grace > 0 {
-			s.watchAckGrace = grace
-		}
-	}
-}
-
-func New(tokenA, tokenB string, callStore *calls.Store, deviceStore *devices.Store, push apns.Sender, options ...Option) *Server {
-	s := &Server{
-		tokenA: tokenA, tokenB: tokenB,
-		calls: callStore, devices: deviceStore, apns: push,
-		watchAckGrace: 1500 * time.Millisecond,
-		watchAcks:     make(map[string]*watchIncomingAttempt),
-	}
-	for _, option := range options {
-		option(s)
-	}
+func New(tokenA, tokenB string, callStore *calls.Store, deviceStore *devices.Store, push apns.Sender) *Server {
+	s := &Server{tokenA: tokenA, tokenB: tokenB, calls: callStore, devices: deviceStore, apns: push}
 	s.media = media.New(callStore)
 	s.mux = http.NewServeMux()
 	s.mux.HandleFunc("GET /v1/health", s.health)
@@ -210,12 +182,6 @@ func (s *Server) notificationDiagnostics(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "invalid diagnostics")
 		return
 	}
-	if role == "A" && body.Role == "A" && body.Platform == "watchOS" && body.Event == "incoming_callkit_reported" && body.Status == "success" && body.CallID != "" {
-		callID := strings.ToLower(body.CallID)
-		if s.calls.IsRinging(callID) && s.acknowledgeWatchIncoming(callID) {
-			slog.Info("watch_callkit_ack_received", "callID", callID, "role", role)
-		}
-	}
 	if body.Event == "callkit_error" {
 		slog.Warn("CallKit error diagnostic", "role", role, "platform", body.Platform, "callID", body.CallID, "stage", body.Stage, "domain", body.ErrorDomain, "code", body.ErrorCode)
 		w.WriteHeader(http.StatusNoContent)
@@ -257,16 +223,6 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("call created", "callID", view.CallID, "caller", view.Caller, "callee", view.Callee, "state", view.State)
 	if device, ok := s.devices.Get(view.Callee); ok {
-		if view.Callee == "A" && device.Platform == "watchOS" {
-			if s.startWatchIncomingDelivery(view, device) {
-				writeJSON(w, http.StatusOK, view)
-				return
-			}
-			slog.Warn("APNs delivery skipped", "callID", view.CallID, "role", view.Callee, "reason", "device_token_missing")
-			s.calls.FailDelivery(view.CallID, "device_token_missing")
-			writeJSON(w, http.StatusOK, view)
-			return
-		}
 		token, pushType := selectIncomingPush(device, view.Callee)
 		if token == "" {
 			slog.Warn("APNs delivery skipped", "callID", view.CallID, "role", view.Callee, "reason", "device_token_missing")
@@ -309,158 +265,6 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		s.calls.FailDelivery(view.CallID, "device_token_missing")
 	}
 	writeJSON(w, http.StatusOK, view)
-}
-
-func (s *Server) startWatchIncomingDelivery(view calls.View, device devices.Registration) bool {
-	voipToken := device.TokenFor("voip", "production")
-	alertToken := device.TokenFor("alert", "production")
-	if voipToken == "" && alertToken == "" {
-		return false
-	}
-	if voipToken == "" {
-		go s.deliverWatchAlertFallback(view, device, alertToken)
-		return true
-	}
-	attempt := s.registerWatchIncomingAttempt(view.CallID)
-	slog.Info("APNs delivery attempted", "callID", view.CallID, "role", view.Callee, "platform", device.Platform, "pushType", "voip", "tokenLength", len(voipToken))
-	slog.Info("watch_voip_probe_attempted", "callID", view.CallID, "role", view.Callee, "platform", device.Platform, "pushType", "voip", "tokenLength", len(voipToken))
-	go s.deliverWatchVoIPProbe(view, device, voipToken, alertToken, attempt)
-	return true
-}
-
-func (s *Server) deliverWatchVoIPProbe(view calls.View, device devices.Registration, voipToken, alertToken string, attempt *watchIncomingAttempt) {
-	ctx, cancel := incomingPushContext(view.RingExpiresAt)
-	result, err := s.apns.IncomingCall(ctx, view.Callee, voipToken, view.CallID, "voip", view.RingExpiresAt)
-	cancel()
-	if err != nil {
-		s.finishWatchIncomingAttempt(view.CallID, attempt)
-		slog.Warn("APNs submission failed", "callID", view.CallID, "status", result.Status, "reason", result.Reason)
-		if result.DeadToken {
-			_ = s.devices.Invalidate(view.Callee, "voip", device.InstallationID, device.InstallationGeneration, voipToken)
-		}
-		if alertToken != "" && s.calls.IsRinging(view.CallID) {
-			s.deliverWatchAlertFallback(view, device, alertToken)
-			return
-		}
-		reason := result.Reason
-		if reason == "" {
-			reason = "unavailable"
-		}
-		s.calls.FailDelivery(view.CallID, reason)
-		return
-	}
-	s.calls.SetDelivery(view.CallID, "watch_voip_probe_submission_accepted")
-	slog.Info("APNs submission accepted", "callID", view.CallID, "status", result.Status, "apnsID", result.APNSID)
-	slog.Info("watch_voip_probe_accepted", "callID", view.CallID, "role", view.Callee, "pushType", "voip")
-
-	timer := time.NewTimer(s.watchAckGrace)
-	defer timer.Stop()
-	poll := time.NewTicker(25 * time.Millisecond)
-	defer poll.Stop()
-	for {
-		select {
-		case <-attempt.acknowledgedCh:
-			s.finishWatchIncomingAttempt(view.CallID, attempt)
-			s.calls.SetDelivery(view.CallID, "watch_callkit_reported")
-			slog.Info("watch_alert_fallback_suppressed", "callID", view.CallID, "role", view.Callee)
-			return
-		case <-timer.C:
-			acknowledged := s.finishWatchIncomingAttempt(view.CallID, attempt)
-			if acknowledged {
-				s.calls.SetDelivery(view.CallID, "watch_callkit_reported")
-				slog.Info("watch_alert_fallback_suppressed", "callID", view.CallID, "role", view.Callee)
-				return
-			}
-			if alertToken != "" && s.calls.IsRinging(view.CallID) {
-				s.deliverWatchAlertFallback(view, device, alertToken)
-			}
-			return
-		case <-poll.C:
-			if !s.calls.IsRinging(view.CallID) {
-				s.finishWatchIncomingAttempt(view.CallID, attempt)
-				return
-			}
-		}
-	}
-}
-
-func (s *Server) deliverWatchAlertFallback(view calls.View, device devices.Registration, alertToken string) {
-	if alertToken == "" || !s.calls.IsRinging(view.CallID) {
-		return
-	}
-	slog.Info("APNs delivery attempted", "callID", view.CallID, "role", view.Callee, "platform", device.Platform, "pushType", "alert", "tokenLength", len(alertToken))
-	slog.Info("watch_alert_fallback_attempted", "callID", view.CallID, "role", view.Callee, "pushType", "alert", "tokenLength", len(alertToken))
-	ctx, cancel := incomingPushContext(view.RingExpiresAt)
-	result, err := s.apns.IncomingCall(ctx, view.Callee, alertToken, view.CallID, "alert", view.RingExpiresAt)
-	cancel()
-	if err != nil {
-		reason := result.Reason
-		if reason == "" {
-			reason = "unavailable"
-		}
-		if result.DeadToken {
-			_ = s.devices.Invalidate(view.Callee, "alert", device.InstallationID, device.InstallationGeneration, alertToken)
-		}
-		s.calls.FailDelivery(view.CallID, reason)
-		slog.Warn("watch_alert_fallback_failed", "callID", view.CallID, "role", view.Callee, "status", result.Status, "reason", result.Reason)
-		return
-	}
-	s.calls.SetDelivery(view.CallID, "watch_alert_fallback_submission_accepted")
-	slog.Info("APNs submission accepted", "callID", view.CallID, "status", result.Status, "apnsID", result.APNSID)
-	slog.Info("watch_alert_fallback_accepted", "callID", view.CallID, "role", view.Callee, "pushType", "alert")
-}
-
-func incomingPushContext(ringExpiresAt time.Time) (context.Context, context.CancelFunc) {
-	deadline := ringExpiresAt
-	if deadline.IsZero() {
-		deadline = time.Now().Add(8 * time.Second)
-	}
-	if maximum := time.Now().Add(8 * time.Second); deadline.After(maximum) {
-		deadline = maximum
-	}
-	return context.WithDeadline(context.Background(), deadline)
-}
-
-func (s *Server) registerWatchIncomingAttempt(callID string) *watchIncomingAttempt {
-	attempt := &watchIncomingAttempt{acknowledgedCh: make(chan struct{})}
-	s.watchAckMu.Lock()
-	if current := s.watchAcks[callID]; current != nil && !current.resolved {
-		attempt = current
-	} else {
-		s.watchAcks[callID] = attempt
-	}
-	s.watchAckMu.Unlock()
-	return attempt
-}
-
-func (s *Server) acknowledgeWatchIncoming(callID string) bool {
-	s.watchAckMu.Lock()
-	defer s.watchAckMu.Unlock()
-	attempt := s.watchAcks[callID]
-	if attempt == nil || attempt.resolved || attempt.acknowledged {
-		return false
-	}
-	attempt.acknowledged = true
-	close(attempt.acknowledgedCh)
-	return true
-}
-
-func (s *Server) finishWatchIncomingAttempt(callID string, attempt *watchIncomingAttempt) bool {
-	s.watchAckMu.Lock()
-	defer s.watchAckMu.Unlock()
-	current := s.watchAcks[callID]
-	if current != attempt {
-		return attempt.acknowledged
-	}
-	delete(s.watchAcks, callID)
-	attempt.resolved = true
-	return attempt.acknowledged
-}
-
-func (s *Server) PendingWatchAcknowledgementsForTesting() int {
-	s.watchAckMu.Lock()
-	defer s.watchAckMu.Unlock()
-	return len(s.watchAcks)
 }
 
 func selectIncomingPush(device devices.Registration, calleeRole string) (token, pushType string) {

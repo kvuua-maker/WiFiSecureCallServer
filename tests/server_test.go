@@ -40,15 +40,6 @@ type pushAttempt struct {
 type pushRecorder struct {
 	attempts chan pushAttempt
 }
-type pushResponse struct {
-	result apns.Result
-	err    error
-}
-type scriptedPushRecorder struct {
-	mu        sync.Mutex
-	attempts  chan pushAttempt
-	responses []pushResponse
-}
 type pushFailure struct{}
 
 func (pushFailure) IncomingCall(context.Context, string, string, string, string, time.Time) (apns.Result, error) {
@@ -61,104 +52,6 @@ func (p *pushRecorder) IncomingCall(_ context.Context, role, token, callID, push
 	return apns.Result{Status: http.StatusOK, Reason: "Success"}, nil
 }
 func (p *pushRecorder) Configured() bool { return true }
-
-func (p *scriptedPushRecorder) IncomingCall(_ context.Context, role, token, callID, pushType string, _ time.Time) (apns.Result, error) {
-	p.attempts <- pushAttempt{role: role, token: token, callID: callID, pushType: pushType}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if len(p.responses) == 0 {
-		return apns.Result{Status: http.StatusOK, Reason: "Success"}, nil
-	}
-	response := p.responses[0]
-	p.responses = p.responses[1:]
-	return response.result, response.err
-}
-func (p *scriptedPushRecorder) Configured() bool { return true }
-
-func watchDeliveryFixture(t *testing.T, push apns.Sender, grace time.Duration, alert, voip bool) (*httptest.Server, *appserver.Server, *calls.Store, *devices.Store, string, string) {
-	t.Helper()
-	deviceStore, err := devices.Open(filepath.Join(t.TempDir(), "devices.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	aAlert, aVoIP := strings.Repeat("a", 64), strings.Repeat("c", 64)
-	caps := devices.Capabilities{VoIPPush: true, AlertPush: true, NotificationsAuthorized: true, MicrophoneReady: true}
-	if alert {
-		if err := deviceStore.Register("A", "watchOS", "alert", aAlert, callID, 1, "production", caps); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if voip {
-		if err := deviceStore.Register("A", "watchOS", "voip", aVoIP, callID, 1, "production", caps); err != nil {
-			t.Fatal(err)
-		}
-	}
-	callStore := calls.New(30*time.Second, 10*time.Second)
-	server := appserver.New(tokenA, tokenB, callStore, deviceStore, push, appserver.WithWatchVoIPAckGraceForTesting(grace))
-	httpServer := httptest.NewServer(server.Handler())
-	return httpServer, server, callStore, deviceStore, aAlert, aVoIP
-}
-
-func createWatchCall(t *testing.T, server string) {
-	t.Helper()
-	resp := request(t, server, http.MethodPost, "/v1/calls", tokenB, createBody())
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("create status: %d", resp.StatusCode)
-	}
-}
-
-func watchDiagnostic(t *testing.T, server, authRole, status string) *http.Response {
-	t.Helper()
-	token := tokenA
-	if authRole == "B" {
-		token = tokenB
-	}
-	body := map[string]any{
-		"requestID": "dddddddd-eeee-4fff-8aaa-bbbbbbbbbbbb",
-		"role":      authRole,
-		"platform":  "watchOS",
-		"event":     "incoming_callkit_reported",
-		"status":    status,
-		"callID":    callID,
-	}
-	return request(t, server, http.MethodPost, "/v1/devices/diagnostics", token, body)
-}
-
-func receivePush(t *testing.T, attempts <-chan pushAttempt, timeout time.Duration) pushAttempt {
-	t.Helper()
-	select {
-	case attempt := <-attempts:
-		return attempt
-	case <-time.After(timeout):
-		t.Fatal("push not attempted")
-		return pushAttempt{}
-	}
-}
-
-func assertNoPush(t *testing.T, attempts <-chan pushAttempt, wait time.Duration) {
-	t.Helper()
-	select {
-	case attempt := <-attempts:
-		t.Fatalf("unexpected push attempt: %+v", attempt)
-	case <-time.After(wait):
-	}
-}
-
-func waitForDeliveryStatus(t *testing.T, store *calls.Store, status string) calls.View {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		view, _ := store.Get(callID, "B")
-		if view.DeliveryStatus == status {
-			return view
-		}
-		time.Sleep(time.Millisecond)
-	}
-	view, _ := store.Get(callID, "B")
-	t.Fatalf("delivery status = %q, want %q", view.DeliveryStatus, status)
-	return calls.View{}
-}
 
 func fixture(t *testing.T) (*httptest.Server, *calls.Store, string) {
 	t.Helper()
@@ -292,7 +185,7 @@ func TestAlertAndVoIPTokensCoexistWithoutCrossRoleOverwrite(t *testing.T) {
 	}
 }
 
-func TestIPhoneIncomingStillUsesOnlyVoIPPrimary(t *testing.T) {
+func TestIPhoneIncomingPrefersVoIPToken(t *testing.T) {
 	dir := t.TempDir()
 	deviceStore, err := devices.Open(filepath.Join(dir, "devices.json"))
 	if err != nil {
@@ -326,222 +219,67 @@ func TestIPhoneIncomingStillUsesOnlyVoIPPrimary(t *testing.T) {
 	}
 }
 
-func TestWatchVoIPAckSuppressesAlertFallback(t *testing.T) {
-	recorder := &pushRecorder{attempts: make(chan pushAttempt, 3)}
-	srv, server, store, _, _, voip := watchDeliveryFixture(t, recorder, 40*time.Millisecond, true, true)
-	defer srv.Close()
-	createWatchCall(t, srv.URL)
-	first := receivePush(t, recorder.attempts, time.Second)
-	if first.role != "A" || first.token != voip || first.pushType != "voip" || first.callID != callID {
-		t.Fatalf("unexpected VoIP probe: %+v", first)
+func TestWatchIncomingPrefersAlertToken(t *testing.T) {
+	deviceStore, err := devices.Open(filepath.Join(t.TempDir(), "devices.json"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	ack := watchDiagnostic(t, srv.URL, "A", "success")
-	if ack.StatusCode != http.StatusNoContent {
-		t.Fatalf("ack status: %d", ack.StatusCode)
+	aAlert, aVoIP := strings.Repeat("a", 64), strings.Repeat("c", 64)
+	caps := devices.Capabilities{VoIPPush: true, AlertPush: true, NotificationsAuthorized: true, MicrophoneReady: true}
+	if err := deviceStore.Register("A", "watchOS", "alert", aAlert, callID, 1, "production", caps); err != nil {
+		t.Fatal(err)
 	}
-	ack.Body.Close()
-	view := waitForDeliveryStatus(t, store, "watch_callkit_reported")
-	if view.State != calls.Ringing {
-		t.Fatalf("ack changed call state: %s", view.State)
+	if err := deviceStore.Register("A", "watchOS", "voip", aVoIP, callID, 1, "production", caps); err != nil {
+		t.Fatal(err)
 	}
-	assertNoPush(t, recorder.attempts, 100*time.Millisecond)
-	if server.PendingWatchAcknowledgementsForTesting() != 0 {
-		t.Fatal("Watch acknowledgement entry leaked")
-	}
-}
-
-func TestWatchNoVoIPAckFallsBackToAlert(t *testing.T) {
-	recorder := &pushRecorder{attempts: make(chan pushAttempt, 3)}
-	srv, _, store, _, alert, voip := watchDeliveryFixture(t, recorder, 30*time.Millisecond, true, true)
-	defer srv.Close()
-	createWatchCall(t, srv.URL)
-	first := receivePush(t, recorder.attempts, time.Second)
-	second := receivePush(t, recorder.attempts, time.Second)
-	if first.token != voip || first.pushType != "voip" || second.token != alert || second.pushType != "alert" || first.callID != callID || second.callID != callID {
-		t.Fatalf("unexpected Watch delivery chain: first=%+v second=%+v", first, second)
-	}
-	view := waitForDeliveryStatus(t, store, "watch_alert_fallback_submission_accepted")
-	if view.State != calls.Ringing {
-		t.Fatalf("fallback changed call state: %s", view.State)
-	}
-	assertNoPush(t, recorder.attempts, 100*time.Millisecond)
-}
-
-func TestWatchCancelledBeforeGraceDoesNotSendAlertFallback(t *testing.T) {
-	recorder := &pushRecorder{attempts: make(chan pushAttempt, 3)}
-	srv, server, store, _, _, voip := watchDeliveryFixture(t, recorder, 80*time.Millisecond, true, true)
-	defer srv.Close()
-	createWatchCall(t, srv.URL)
-	first := receivePush(t, recorder.attempts, time.Second)
-	if first.token != voip || first.pushType != "voip" {
-		t.Fatalf("unexpected VoIP probe: %+v", first)
-	}
-	cancel := request(t, srv.URL, http.MethodPost, "/v1/calls/"+callID+"/cancel", tokenB, mutationBody("eeeeeeee-ffff-4aaa-8bbb-cccccccccccc"))
-	if cancel.StatusCode != http.StatusOK {
-		t.Fatalf("cancel status: %d", cancel.StatusCode)
-	}
-	cancel.Body.Close()
-	assertNoPush(t, recorder.attempts, 150*time.Millisecond)
-	view, _ := store.Get(callID, "B")
-	if view.State != calls.Cancelled {
-		t.Fatalf("call state: %s", view.State)
-	}
-	if server.PendingWatchAcknowledgementsForTesting() != 0 {
-		t.Fatal("cancelled call acknowledgement entry leaked")
-	}
-}
-
-func TestWatchNonSuccessDiagnosticDoesNotSuppressFallback(t *testing.T) {
-	recorder := &pushRecorder{attempts: make(chan pushAttempt, 3)}
-	srv, _, _, _, alert, voip := watchDeliveryFixture(t, recorder, 40*time.Millisecond, true, true)
-	defer srv.Close()
-	createWatchCall(t, srv.URL)
-	first := receivePush(t, recorder.attempts, time.Second)
-	if first.token != voip || first.pushType != "voip" {
-		t.Fatalf("unexpected VoIP probe: %+v", first)
-	}
-	diagnostic := watchDiagnostic(t, srv.URL, "A", "push_received voip")
-	if diagnostic.StatusCode != http.StatusNoContent {
-		t.Fatalf("diagnostic status: %d", diagnostic.StatusCode)
-	}
-	diagnostic.Body.Close()
-	second := receivePush(t, recorder.attempts, time.Second)
-	if second.token != alert || second.pushType != "alert" {
-		t.Fatalf("fallback suppressed by non-success diagnostic: %+v", second)
-	}
-}
-
-func TestRoleBCannotAcknowledgeWatchCall(t *testing.T) {
-	recorder := &pushRecorder{attempts: make(chan pushAttempt, 3)}
-	srv, _, _, _, alert, _ := watchDeliveryFixture(t, recorder, 40*time.Millisecond, true, true)
-	defer srv.Close()
-	createWatchCall(t, srv.URL)
-	receivePush(t, recorder.attempts, time.Second)
-	diagnostic := watchDiagnostic(t, srv.URL, "B", "success")
-	if diagnostic.StatusCode != http.StatusNoContent {
-		t.Fatalf("diagnostic status: %d", diagnostic.StatusCode)
-	}
-	diagnostic.Body.Close()
-	second := receivePush(t, recorder.attempts, time.Second)
-	if second.token != alert || second.pushType != "alert" {
-		t.Fatalf("role B suppressed Watch fallback: %+v", second)
-	}
-}
-
-func TestWatchVoIPFailureImmediatelyUsesAlertFallback(t *testing.T) {
-	recorder := &scriptedPushRecorder{
-		attempts: make(chan pushAttempt, 3),
-		responses: []pushResponse{
-			{result: apns.Result{Status: http.StatusServiceUnavailable, Reason: "ServiceUnavailable"}, err: errors.New("APNs unavailable")},
-			{result: apns.Result{Status: http.StatusOK, Reason: "Success"}},
-		},
-	}
-	srv, _, store, _, alert, voip := watchDeliveryFixture(t, recorder, 500*time.Millisecond, true, true)
-	defer srv.Close()
-	createWatchCall(t, srv.URL)
-	first := receivePush(t, recorder.attempts, time.Second)
-	second := receivePush(t, recorder.attempts, 200*time.Millisecond)
-	if first.token != voip || first.pushType != "voip" || second.token != alert || second.pushType != "alert" {
-		t.Fatalf("unexpected immediate fallback chain: first=%+v second=%+v", first, second)
-	}
-	view := waitForDeliveryStatus(t, store, "watch_alert_fallback_submission_accepted")
-	if view.State != calls.Ringing {
-		t.Fatalf("VoIP probe failure terminalized call: %s", view.State)
-	}
-}
-
-func TestWatchDeadVoIPTokenDoesNotInvalidateAlertToken(t *testing.T) {
-	recorder := &scriptedPushRecorder{
-		attempts: make(chan pushAttempt, 3),
-		responses: []pushResponse{
-			{result: apns.Result{Status: http.StatusGone, Reason: "Unregistered", DeadToken: true}, err: errors.New("dead VoIP token")},
-			{result: apns.Result{Status: http.StatusOK, Reason: "Success"}},
-		},
-	}
-	srv, _, store, deviceStore, alert, _ := watchDeliveryFixture(t, recorder, 500*time.Millisecond, true, true)
-	defer srv.Close()
-	createWatchCall(t, srv.URL)
-	receivePush(t, recorder.attempts, time.Second)
-	second := receivePush(t, recorder.attempts, 200*time.Millisecond)
-	if second.token != alert || second.pushType != "alert" {
-		t.Fatalf("alert fallback missing after dead VoIP token: %+v", second)
-	}
-	waitForDeliveryStatus(t, store, "watch_alert_fallback_submission_accepted")
-	registration, ok := deviceStore.Get("A")
-	if !ok || registration.VoIPToken != "" || registration.AlertToken != alert {
-		t.Fatalf("wrong token invalidated: alertPresent=%t voipPresent=%t", registration.AlertToken != "", registration.VoIPToken != "")
-	}
-}
-
-func TestWatchMissingVoIPUsesAlertImmediately(t *testing.T) {
 	recorder := &pushRecorder{attempts: make(chan pushAttempt, 2)}
-	srv, _, store, _, alert, _ := watchDeliveryFixture(t, recorder, 500*time.Millisecond, true, false)
+	srv := httptest.NewServer(appserver.New(tokenA, tokenB, calls.New(30*time.Second, 10*time.Second), deviceStore, recorder).Handler())
 	defer srv.Close()
-	createWatchCall(t, srv.URL)
-	attempt := receivePush(t, recorder.attempts, 200*time.Millisecond)
-	if attempt.token != alert || attempt.pushType != "alert" || attempt.callID != callID {
-		t.Fatalf("unexpected direct alert: %+v", attempt)
+	resp := request(t, srv.URL, "POST", "/v1/calls", tokenB, createBody())
+	resp.Body.Close()
+	select {
+	case attempt := <-recorder.attempts:
+		if attempt.role != "A" || attempt.token != aAlert || attempt.pushType != "alert" || attempt.callID != callID {
+			t.Fatalf("unexpected push attempt: %+v", attempt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("push not attempted")
 	}
-	waitForDeliveryStatus(t, store, "watch_alert_fallback_submission_accepted")
-	assertNoPush(t, recorder.attempts, 100*time.Millisecond)
+	select {
+	case attempt := <-recorder.attempts:
+		t.Fatalf("unexpected duplicate push attempt: %+v", attempt)
+	case <-time.After(100 * time.Millisecond):
+	}
 }
 
-func TestWatchVoIPOnlyDoesNotInventAlertFallback(t *testing.T) {
+func TestWatchIncomingFallsBackToVoIPWhenAlertMissing(t *testing.T) {
+	deviceStore, err := devices.Open(filepath.Join(t.TempDir(), "devices.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	aVoIP := strings.Repeat("c", 64)
+	caps := devices.Capabilities{VoIPPush: true, AlertPush: true, NotificationsAuthorized: true, MicrophoneReady: true}
+	if err := deviceStore.Register("A", "watchOS", "voip", aVoIP, callID, 1, "production", caps); err != nil {
+		t.Fatal(err)
+	}
 	recorder := &pushRecorder{attempts: make(chan pushAttempt, 2)}
-	srv, server, store, _, _, voip := watchDeliveryFixture(t, recorder, 30*time.Millisecond, false, true)
+	srv := httptest.NewServer(appserver.New(tokenA, tokenB, calls.New(30*time.Second, 10*time.Second), deviceStore, recorder).Handler())
 	defer srv.Close()
-	createWatchCall(t, srv.URL)
-	attempt := receivePush(t, recorder.attempts, time.Second)
-	if attempt.token != voip || attempt.pushType != "voip" || attempt.callID != callID {
-		t.Fatalf("unexpected VoIP-only delivery: %+v", attempt)
+	resp := request(t, srv.URL, "POST", "/v1/calls", tokenB, createBody())
+	resp.Body.Close()
+	select {
+	case attempt := <-recorder.attempts:
+		if attempt.role != "A" || attempt.token != aVoIP || attempt.pushType != "voip" || attempt.callID != callID {
+			t.Fatalf("unexpected push attempt: %+v", attempt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("push not attempted")
 	}
-	assertNoPush(t, recorder.attempts, 100*time.Millisecond)
-	view, _ := store.Get(callID, "B")
-	if view.State != calls.Ringing || view.DeliveryStatus != "watch_voip_probe_submission_accepted" {
-		t.Fatalf("unexpected VoIP-only state: %+v", view)
+	select {
+	case attempt := <-recorder.attempts:
+		t.Fatalf("unexpected duplicate push attempt: %+v", attempt)
+	case <-time.After(100 * time.Millisecond):
 	}
-	if server.PendingWatchAcknowledgementsForTesting() != 0 {
-		t.Fatal("VoIP-only acknowledgement entry leaked")
-	}
-}
-
-func TestDuplicateCreateDoesNotStartDuplicateWatchDeliveryChain(t *testing.T) {
-	recorder := &pushRecorder{attempts: make(chan pushAttempt, 4)}
-	srv, _, _, _, alert, voip := watchDeliveryFixture(t, recorder, 30*time.Millisecond, true, true)
-	defer srv.Close()
-	createWatchCall(t, srv.URL)
-	first := receivePush(t, recorder.attempts, time.Second)
-	createWatchCall(t, srv.URL)
-	second := receivePush(t, recorder.attempts, time.Second)
-	if first.token != voip || first.pushType != "voip" || second.token != alert || second.pushType != "alert" {
-		t.Fatalf("unexpected delivery chain: first=%+v second=%+v", first, second)
-	}
-	assertNoPush(t, recorder.attempts, 100*time.Millisecond)
-}
-
-func TestWatchAcknowledgementRegistryCleansUpAndLateAckIsSafe(t *testing.T) {
-	recorder := &pushRecorder{attempts: make(chan pushAttempt, 4)}
-	srv, server, _, _, _, _ := watchDeliveryFixture(t, recorder, 30*time.Millisecond, true, true)
-	defer srv.Close()
-	createWatchCall(t, srv.URL)
-	receivePush(t, recorder.attempts, time.Second)
-	receivePush(t, recorder.attempts, time.Second)
-	deadline := time.Now().Add(time.Second)
-	for server.PendingWatchAcknowledgementsForTesting() != 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if server.PendingWatchAcknowledgementsForTesting() != 0 {
-		t.Fatal("Watch acknowledgement entry leaked")
-	}
-	late := watchDiagnostic(t, srv.URL, "A", "success")
-	if late.StatusCode != http.StatusNoContent {
-		t.Fatalf("late acknowledgement status: %d", late.StatusCode)
-	}
-	late.Body.Close()
-	if server.PendingWatchAcknowledgementsForTesting() != 0 {
-		t.Fatal("late acknowledgement recreated registry entry")
-	}
-	assertNoPush(t, recorder.attempts, 100*time.Millisecond)
 }
 
 func TestWatchLiveReadyUsesAlertPath(t *testing.T) {
