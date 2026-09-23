@@ -2,11 +2,16 @@ package server
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/accountcalls"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/accounts"
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/apns"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/phoneauth"
 )
 
@@ -25,6 +30,206 @@ func (s *Server) registerV2() {
 	s.mux.HandleFunc("POST /v2/watch-link/claim", s.v2Auth(s.watchLinkClaim))
 	s.mux.HandleFunc("POST /v2/watch-link/status", s.watchLinkStatus)
 	s.mux.HandleFunc("POST /v2/devices/register", s.v2Auth(s.v2RegisterDevice))
+	s.mux.HandleFunc("GET /v2/devices", s.v2Auth(s.v2Devices))
+	s.mux.HandleFunc("POST /v2/calls", s.v2Auth(s.v2CreateCall))
+	s.mux.HandleFunc("GET /v2/calls/{id}", s.v2Auth(s.v2GetCall))
+	s.mux.HandleFunc("POST /v2/calls/{id}/{action}", s.v2Auth(s.v2MutateCall))
+}
+
+type v2DeviceSummary struct {
+	DeviceID   string    `json:"deviceID"`
+	Platform   string    `json:"platform"`
+	CallReady  bool      `json:"callReady"`
+	LastSeenAt time.Time `json:"lastSeenAt"`
+}
+
+func (s *Server) v2Devices(w http.ResponseWriter, r *http.Request) {
+	identity := identityFrom(r.Context())
+	devices := s.phoneAuth.DevicesForAccount(identity.AccountID)
+	result := make([]v2DeviceSummary, 0, len(devices))
+	for _, device := range devices {
+		result = append(result, v2DeviceSummary{DeviceID: device.DeviceID, Platform: device.Platform, CallReady: accountDeviceCallReady(device), LastSeenAt: device.LastSeenAt})
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func accountDeviceCallReady(device accounts.Device) bool {
+	if device.Environment != "production" || !device.Capabilities.MicrophoneReady {
+		return false
+	}
+	if device.Platform == "iOS" {
+		return device.VoIPToken != "" && device.Capabilities.VoIPPush
+	}
+	if device.Platform == "watchOS" {
+		return device.AlertToken != "" && device.Capabilities.AlertPush && device.Capabilities.NotificationsAuthorized
+	}
+	return false
+}
+
+type v2CallCreateRequest struct{ RequestID, CallID, TargetDeviceID string }
+type v2CallMutationRequest struct{ RequestID string }
+
+func (s *Server) v2CreateCall(w http.ResponseWriter, r *http.Request) {
+	if s.accountCalls == nil {
+		writeError(w, http.StatusServiceUnavailable, "account calls unavailable")
+		return
+	}
+	var body v2CallCreateRequest
+	if err := decode(w, r, &body); err != nil || !validID(body.RequestID) || !validID(body.CallID) || !validID(body.TargetDeviceID) {
+		writeError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	identity := identityFrom(r.Context())
+	target, ok := s.phoneAuth.DeviceForAccount(identity.AccountID, body.TargetDeviceID)
+	if !ok || strings.EqualFold(target.DeviceID, identity.DeviceID) {
+		writeError(w, http.StatusForbidden, "target device unavailable")
+		return
+	}
+	if !accountDeviceCallReady(target) {
+		writeError(w, http.StatusConflict, "target device not call-ready")
+		return
+	}
+	view, createdNew, err := s.accountCalls.Create(body.CallID, body.RequestID, identity.AccountID, identity.DeviceID, target.DeviceID)
+	if err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if !createdNew {
+		if current, currentErr := s.accountCalls.Get(view.CallID, identity.AccountID, identity.DeviceID); currentErr == nil {
+			view = current
+		}
+		writeJSON(w, http.StatusOK, view)
+		return
+	}
+	slog.Info("account call created", "callID", view.CallID, "callerAccountID", identity.AccountID, "callerDeviceID", identity.DeviceID, "calleeDeviceID", target.DeviceID)
+	token, pushType := selectAccountIncomingPush(target)
+	if token == "" {
+		s.accountCalls.FailDelivery(view.CallID, "device_token_missing")
+		if current, currentErr := s.accountCalls.Get(view.CallID, identity.AccountID, identity.DeviceID); currentErr == nil {
+			view = current
+		}
+		writeJSON(w, http.StatusOK, view)
+		return
+	}
+	slog.Info("account APNs delivery attempted", "callID", view.CallID, "platform", target.Platform, "pushType", pushType, "tokenLength", len(token))
+	go s.deliverAccountIncoming(view, target, token, pushType, identity.AccountID)
+	writeJSON(w, http.StatusOK, view)
+}
+
+func selectAccountIncomingPush(device accounts.Device) (string, string) {
+	if device.Environment != "production" {
+		return "", ""
+	}
+	if device.Platform == "watchOS" {
+		if device.AlertToken != "" && device.Capabilities.AlertPush && device.Capabilities.NotificationsAuthorized {
+			return device.AlertToken, "alert"
+		}
+		if device.VoIPToken != "" && device.Capabilities.VoIPPush {
+			return device.VoIPToken, "voip"
+		}
+		return "", "alert"
+	}
+	if device.Platform == "iOS" {
+		if device.VoIPToken != "" && device.Capabilities.VoIPPush {
+			return device.VoIPToken, "voip"
+		}
+		if device.AlertToken != "" && device.Capabilities.AlertPush && device.Capabilities.NotificationsAuthorized {
+			return device.AlertToken, "alert"
+		}
+		return "", "voip"
+	}
+	return "", ""
+}
+
+func (s *Server) deliverAccountIncoming(view accountcalls.View, device accounts.Device, token, pushType, accountID string) {
+	if !s.accountCalls.IsRinging(view.CallID) {
+		return
+	}
+	sender, ok := s.apns.(apns.AccountSender)
+	if !ok {
+		s.accountCalls.FailDelivery(view.CallID, "account_push_unavailable")
+		return
+	}
+	deadline := view.RingExpiresAt
+	if deadline.IsZero() || deadline.After(time.Now().Add(8*time.Second)) {
+		deadline = time.Now().Add(8 * time.Second)
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	result, err := sender.IncomingAccountCall(ctx, device.Platform, token, view.CallID, pushType, view.RingExpiresAt, accountID)
+	if err != nil {
+		reason := result.Reason
+		if reason == "" {
+			reason = "unavailable"
+		}
+		s.accountCalls.FailDelivery(view.CallID, reason)
+		if s.accountMedia != nil {
+			s.accountMedia.CloseCall(view.CallID, "delivery failed")
+		}
+		if result.DeadToken {
+			_ = s.phoneAuth.InvalidateAccountDeviceToken(accountID, device.DeviceID, pushType, token, device.InstallationGeneration)
+		}
+		slog.Warn("account APNs submission failed", "callID", view.CallID, "status", result.Status, "reason", result.Reason)
+		return
+	}
+	s.accountCalls.SetDelivery(view.CallID, "submission_accepted")
+	slog.Info("account APNs submission accepted", "callID", view.CallID, "status", result.Status, "apnsID", result.APNSID)
+}
+
+func (s *Server) v2GetCall(w http.ResponseWriter, r *http.Request) {
+	if s.accountCalls == nil {
+		writeError(w, http.StatusServiceUnavailable, "account calls unavailable")
+		return
+	}
+	identity := identityFrom(r.Context())
+	view, err := s.accountCalls.Get(r.PathValue("id"), identity.AccountID, identity.DeviceID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "call not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+func (s *Server) v2MutateCall(w http.ResponseWriter, r *http.Request) {
+	if s.accountCalls == nil {
+		writeError(w, http.StatusServiceUnavailable, "account calls unavailable")
+		return
+	}
+	var body v2CallMutationRequest
+	if err := decode(w, r, &body); err != nil || !validID(body.RequestID) {
+		writeError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	var target accountcalls.State
+	switch r.PathValue("action") {
+	case "accept":
+		target = accountcalls.Accepted
+	case "reject":
+		target = accountcalls.Rejected
+	case "cancel":
+		target = accountcalls.Cancelled
+	case "end":
+		target = accountcalls.Ended
+	default:
+		writeError(w, http.StatusNotFound, "unknown action")
+		return
+	}
+	identity := identityFrom(r.Context())
+	view, _, err := s.accountCalls.Mutate(r.PathValue("id"), body.RequestID, identity.AccountID, identity.DeviceID, target)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			writeError(w, http.StatusRequestTimeout, "cancelled")
+		} else {
+			writeError(w, http.StatusConflict, err.Error())
+		}
+		return
+	}
+	if view.State == accountcalls.Ended || view.State == accountcalls.Cancelled || view.State == accountcalls.Rejected || view.State == accountcalls.Expired {
+		if s.accountMedia != nil {
+			s.accountMedia.CloseCall(view.CallID, string(view.State))
+		}
+	}
+	writeJSON(w, http.StatusOK, view)
 }
 
 type v2DeviceCapabilities struct {

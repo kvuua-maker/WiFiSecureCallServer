@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/accountcalls"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/accounts"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/apns"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/calls"
@@ -59,6 +60,29 @@ type pushAttempt struct {
 type pushRecorder struct {
 	attempts chan pushAttempt
 }
+
+type accountPushAttempt struct {
+	platform, token, callID, pushType, accountID string
+}
+
+type accountPushRecorder struct {
+	attempts chan accountPushAttempt
+	result   apns.Result
+	err      error
+}
+
+func (p *accountPushRecorder) IncomingCall(context.Context, string, string, string, string, time.Time) (apns.Result, error) {
+	return apns.Result{Status: http.StatusOK, Reason: "Success"}, nil
+}
+func (p *accountPushRecorder) IncomingAccountCall(_ context.Context, platform, token, callID, pushType string, _ time.Time, accountID string) (apns.Result, error) {
+	p.attempts <- accountPushAttempt{platform: platform, token: token, callID: callID, pushType: pushType, accountID: accountID}
+	if p.result.Status == 0 {
+		p.result = apns.Result{Status: http.StatusOK, Reason: "Success"}
+	}
+	return p.result, p.err
+}
+func (p *accountPushRecorder) Configured() bool { return true }
+
 type pushFailure struct{}
 
 func (pushFailure) IncomingCall(context.Context, string, string, string, string, time.Time) (apns.Result, error) {
@@ -226,6 +250,240 @@ func TestSMSDisabledKeepsExistingV2SessionsAndRoutesAvailable(t *testing.T) {
 		t.Fatalf("watch claim status=%d", claim.StatusCode)
 	}
 	claim.Body.Close()
+}
+
+type accountCallFixture struct {
+	server                       *httptest.Server
+	auth                         *phoneauth.Service
+	accountID, iPhoneID, watchID string
+	iPhoneToken, watchToken      string
+	store                        *accountcalls.Store
+	push                         *accountPushRecorder
+}
+
+func newAccountCallFixture(t *testing.T) accountCallFixture {
+	t.Helper()
+	dir := t.TempDir()
+	accountStore, err := accounts.Open(filepath.Join(dir, "accounts.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := &v2SMSSender{}
+	auth, err := phoneauth.New(accountStore, sender, "0123456789abcdef0123456789abcdef", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := auth.Start(context.Background(), "21000000-0000-4000-8000-000000000001", "+380501234567", "192.0.2.10")
+	if err != nil {
+		t.Fatal(err)
+	}
+	phone, err := auth.Verify("21000000-0000-4000-8000-000000000002", started.VerificationID, sender.code, "21000000-0000-4000-8000-000000000003", "iOS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	phoneIdentity, err := auth.Authenticate(phone.AccessToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link, err := auth.WatchStart("21000000-0000-4000-8000-000000000004", "21000000-0000-4000-8000-000000000005", "watchOS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := auth.WatchClaim(phoneIdentity, "21000000-0000-4000-8000-000000000006", link.Code); err != nil {
+		t.Fatal(err)
+	}
+	watch, err := auth.WatchStatus(link.LinkID, link.LinkSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	watchIdentity, err := auth.Authenticate(watch.AccessToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capabilities := accounts.DeviceCapabilities{VoIPPush: true, AlertPush: true, NotificationsAuthorized: true, MicrophoneReady: true}
+	for _, registration := range []struct {
+		identity    phoneauth.Identity
+		kind, token string
+	}{
+		{phoneIdentity, "alert", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		{phoneIdentity, "voip", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+		{watchIdentity, "alert", "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+		{watchIdentity, "voip", "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
+	} {
+		if err := auth.RegisterDevice(registration.identity, phoneauth.DeviceRegistration{RequestID: "22000000-0000-4000-8000-000000000001", DeviceID: registration.identity.DeviceID, Platform: registration.identity.Platform, PushType: registration.kind, Token: registration.token, InstallationGeneration: 1, Environment: "production", Capabilities: capabilities}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	legacyDevices, err := devices.Open(filepath.Join(dir, "devices.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	push := &accountPushRecorder{attempts: make(chan accountPushAttempt, 4)}
+	store := accountcalls.New(30 * time.Second)
+	app := appserver.NewWithV2Calls(tokenA, tokenB, calls.New(30*time.Second, 0), legacyDevices, push, auth, store)
+	return accountCallFixture{server: httptest.NewServer(app.Handler()), auth: auth, accountID: phone.Account.AccountID, iPhoneID: phone.DeviceID, watchID: watchIdentity.DeviceID, iPhoneToken: phone.AccessToken, watchToken: watch.AccessToken, store: store, push: push}
+}
+
+func TestV2DevicesAreAccountScopedSanitizedAndCallReady(t *testing.T) {
+	fixture := newAccountCallFixture(t)
+	defer fixture.server.Close()
+	response := request(t, fixture.server.URL, http.MethodGet, "/v2/devices", fixture.iPhoneToken, nil)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", response.StatusCode)
+	}
+	var raw []map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&raw); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if len(raw) != 2 {
+		t.Fatalf("devices=%#v", raw)
+	}
+	seen := map[string]bool{}
+	for _, device := range raw {
+		id, _ := device["deviceID"].(string)
+		seen[id] = true
+		if device["callReady"] != true {
+			t.Fatalf("not ready: %#v", device)
+		}
+		for _, secret := range []string{"alertToken", "voipToken", "capabilities", "accessToken", "refreshToken"} {
+			if _, exists := device[secret]; exists {
+				t.Fatalf("device response exposed %s", secret)
+			}
+		}
+	}
+	if !seen[fixture.iPhoneID] || !seen[fixture.watchID] {
+		t.Fatalf("wrong devices=%#v", raw)
+	}
+}
+
+func TestV2SameAccountCallPermissionsMediaTokensAndWatchPush(t *testing.T) {
+	fixture := newAccountCallFixture(t)
+	defer fixture.server.Close()
+	call := "23000000-0000-4000-8000-000000000001"
+	create := map[string]string{"requestID": "23000000-0000-4000-8000-000000000002", "callID": call, "targetDeviceID": fixture.watchID}
+	response := request(t, fixture.server.URL, http.MethodPost, "/v2/calls", fixture.iPhoneToken, create)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("create status=%d", response.StatusCode)
+	}
+	var caller accountcalls.View
+	if err := json.NewDecoder(response.Body).Decode(&caller); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if caller.LocalSide != accountcalls.SideCaller || caller.State != accountcalls.Ringing || !caller.CreatedNew || caller.MediaToken != "" {
+		t.Fatalf("caller create=%+v", caller)
+	}
+	select {
+	case attempt := <-fixture.push.attempts:
+		if attempt.platform != "watchOS" || attempt.pushType != "alert" || attempt.accountID != fixture.accountID || attempt.callID != call {
+			t.Fatalf("push=%+v", attempt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("account push not attempted")
+	}
+
+	accept := request(t, fixture.server.URL, http.MethodPost, "/v2/calls/"+call+"/accept", fixture.watchToken, mutationBody("23000000-0000-4000-8000-000000000003"))
+	if accept.StatusCode != http.StatusOK {
+		t.Fatalf("accept status=%d", accept.StatusCode)
+	}
+	var callee accountcalls.View
+	if err := json.NewDecoder(accept.Body).Decode(&callee); err != nil {
+		t.Fatal(err)
+	}
+	accept.Body.Close()
+	callerResponse := request(t, fixture.server.URL, http.MethodGet, "/v2/calls/"+call, fixture.iPhoneToken, nil)
+	if err := json.NewDecoder(callerResponse.Body).Decode(&caller); err != nil {
+		t.Fatal(err)
+	}
+	callerResponse.Body.Close()
+	if caller.LocalSide != accountcalls.SideCaller || callee.LocalSide != accountcalls.SideCallee || caller.MediaToken == "" || callee.MediaToken == "" || caller.MediaToken == callee.MediaToken {
+		t.Fatalf("caller=%+v callee=%+v", caller, callee)
+	}
+	if !fixture.store.ValidateMedia(call, "caller", caller.MediaToken) || fixture.store.ValidateMedia(call, "callee", caller.MediaToken) {
+		t.Fatal("media token side isolation failed")
+	}
+
+	callerAccept := request(t, fixture.server.URL, http.MethodPost, "/v2/calls/"+call+"/accept", fixture.iPhoneToken, mutationBody("23000000-0000-4000-8000-000000000004"))
+	if callerAccept.StatusCode == http.StatusOK {
+		t.Fatal("caller accepted")
+	}
+	callerAccept.Body.Close()
+	end := request(t, fixture.server.URL, http.MethodPost, "/v2/calls/"+call+"/end", fixture.iPhoneToken, mutationBody("23000000-0000-4000-8000-000000000005"))
+	if end.StatusCode != http.StatusOK {
+		t.Fatalf("end status=%d", end.StatusCode)
+	}
+	end.Body.Close()
+}
+
+func TestV2IPhonePushPreferenceAndDeadTokenInvalidationAreAccountScoped(t *testing.T) {
+	fixture := newAccountCallFixture(t)
+	defer fixture.server.Close()
+	call := "25000000-0000-4000-8000-000000000001"
+	body := map[string]string{"requestID": "25000000-0000-4000-8000-000000000002", "callID": call, "targetDeviceID": fixture.iPhoneID}
+	response := request(t, fixture.server.URL, http.MethodPost, "/v2/calls", fixture.watchToken, body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("create status=%d", response.StatusCode)
+	}
+	select {
+	case attempt := <-fixture.push.attempts:
+		if attempt.platform != "iOS" || attempt.pushType != "voip" || attempt.token != strings.Repeat("b", 64) {
+			t.Fatalf("iPhone push=%+v", attempt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("iPhone push not attempted")
+	}
+
+	dead := newAccountCallFixture(t)
+	defer dead.server.Close()
+	dead.push.result = apns.Result{Status: http.StatusGone, Reason: "Unregistered", DeadToken: true}
+	dead.push.err = errors.New("dead token")
+	deadCall := "25000000-0000-4000-8000-000000000003"
+	response = request(t, dead.server.URL, http.MethodPost, "/v2/calls", dead.iPhoneToken, map[string]string{"requestID": "25000000-0000-4000-8000-000000000004", "callID": deadCall, "targetDeviceID": dead.watchID})
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("dead-token create status=%d", response.StatusCode)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		device, ok := dead.auth.DeviceForAccount(dead.accountID, dead.watchID)
+		if ok && device.AlertToken == "" {
+			if device.VoIPToken == "" {
+				t.Fatal("dead alert invalidated Watch VoIP token")
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("dead account token was not invalidated")
+}
+
+func TestV2CallTargetMustBelongToAuthenticatedAccountAndNoSelfCall(t *testing.T) {
+	fixture := newAccountCallFixture(t)
+	defer fixture.server.Close()
+	for name, target := range map[string]string{"self": fixture.iPhoneID, "foreign": "24000000-0000-4000-8000-000000000009"} {
+		t.Run(name, func(t *testing.T) {
+			body := map[string]string{"requestID": "24000000-0000-4000-8000-000000000001", "callID": "24000000-0000-4000-8000-000000000002", "targetDeviceID": target}
+			response := request(t, fixture.server.URL, http.MethodPost, "/v2/calls", fixture.iPhoneToken, body)
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusForbidden {
+				t.Fatalf("status=%d", response.StatusCode)
+			}
+		})
+	}
+}
+
+func TestMediaRouterRejectsAmbiguousOrMissingPeerShape(t *testing.T) {
+	fixture := newAccountCallFixture(t)
+	defer fixture.server.Close()
+	for _, path := range []string{"/media?callID=" + callID, "/media?callID=" + callID + "&role=A&side=caller"} {
+		response := request(t, fixture.server.URL, http.MethodGet, path, tokenA, nil)
+		response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s status=%d", path, response.StatusCode)
+		}
+	}
 }
 
 func TestDeploymentPreservesProductionConfigAndExplicitlyRestarts(t *testing.T) {

@@ -436,6 +436,40 @@ func (s *Service) DevicesForAccount(accountID string) []accounts.Device {
 	return result
 }
 
+func (s *Service) DeviceForAccount(accountID, deviceID string) (accounts.Device, bool) {
+	accountID, deviceID = strings.ToLower(accountID), strings.ToLower(deviceID)
+	for _, device := range s.store.Snapshot().Devices {
+		if strings.ToLower(device.AccountID) == accountID && strings.ToLower(device.DeviceID) == deviceID {
+			return device, true
+		}
+	}
+	return accounts.Device{}, false
+}
+
+func (s *Service) InvalidateAccountDeviceToken(accountID, deviceID, pushType, expectedToken string, generation uint64) error {
+	if (pushType != "alert" && pushType != "voip") || expectedToken == "" {
+		return bad("invalid device registration")
+	}
+	accountID, deviceID = strings.ToLower(accountID), strings.ToLower(deviceID)
+	return s.store.Update(func(state *accounts.State) error {
+		for index := range state.Devices {
+			device := state.Devices[index]
+			if strings.ToLower(device.AccountID) != accountID || strings.ToLower(device.DeviceID) != deviceID || device.InstallationGeneration != generation {
+				continue
+			}
+			if pushType == "alert" && constantStringEqual(device.AlertToken, expectedToken) {
+				device.AlertToken, device.AlertUpdatedAt = "", time.Time{}
+			}
+			if pushType == "voip" && constantStringEqual(device.VoIPToken, expectedToken) {
+				device.VoIPToken, device.VoIPUpdatedAt = "", time.Time{}
+			}
+			state.Devices[index] = device
+			return nil
+		}
+		return nil
+	})
+}
+
 func (s *Service) WatchStart(requestID, deviceID, platform string) (WatchStartResult, error) {
 	if !validUUID(requestID) || !validUUID(deviceID) || platform != "watchOS" {
 		return WatchStartResult{}, bad("invalid request")

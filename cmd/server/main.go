@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/accountcalls"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/accounts"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/apns"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/calls"
@@ -60,7 +61,7 @@ func main() {
 			slog.Error("phone authentication configuration failed", "error", e)
 			os.Exit(1)
 		}
-		server = appserver.NewWithV2(cfg.TokenA, cfg.TokenB, callStore, deviceStore, push, auth)
+		server = appserver.NewWithV2Calls(cfg.TokenA, cfg.TokenB, callStore, deviceStore, push, auth, accountcalls.New(cfg.RingTimeout))
 	}
 	httpServer := &http.Server{Addr: cfg.Address, Handler: server.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 8192}
 	slog.Info("wifi-secure-call listening", "address", cfg.Address, "apnsConfigured", push.Configured())

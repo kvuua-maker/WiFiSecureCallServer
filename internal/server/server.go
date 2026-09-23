@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/accountcalls"
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/accountmedia"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/apns"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/calls"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/devices"
@@ -27,6 +29,8 @@ type Server struct {
 	media          *media.Hub
 	mux            *http.ServeMux
 	phoneAuth      *phoneauth.Service
+	accountCalls   *accountcalls.Store
+	accountMedia   *accountmedia.Hub
 }
 
 func New(tokenA, tokenB string, callStore *calls.Store, deviceStore *devices.Store, push apns.Sender) *Server {
@@ -34,8 +38,19 @@ func New(tokenA, tokenB string, callStore *calls.Store, deviceStore *devices.Sto
 }
 
 func NewWithV2(tokenA, tokenB string, callStore *calls.Store, deviceStore *devices.Store, push apns.Sender, auth *phoneauth.Service) *Server {
-	s := &Server{tokenA: tokenA, tokenB: tokenB, calls: callStore, devices: deviceStore, apns: push, phoneAuth: auth}
+	var accountCallStore *accountcalls.Store
+	if auth != nil {
+		accountCallStore = accountcalls.New(30 * time.Second)
+	}
+	return NewWithV2Calls(tokenA, tokenB, callStore, deviceStore, push, auth, accountCallStore)
+}
+
+func NewWithV2Calls(tokenA, tokenB string, callStore *calls.Store, deviceStore *devices.Store, push apns.Sender, auth *phoneauth.Service, accountCallStore *accountcalls.Store) *Server {
+	s := &Server{tokenA: tokenA, tokenB: tokenB, calls: callStore, devices: deviceStore, apns: push, phoneAuth: auth, accountCalls: accountCallStore}
 	s.media = media.New(callStore)
+	if accountCallStore != nil {
+		s.accountMedia = accountmedia.New(accountCallStore)
+	}
 	s.mux = http.NewServeMux()
 	s.mux.HandleFunc("GET /v1/health", s.health)
 	s.mux.HandleFunc("POST /v1/devices/register", s.auth(s.register))
@@ -43,12 +58,30 @@ func NewWithV2(tokenA, tokenB string, callStore *calls.Store, deviceStore *devic
 	s.mux.HandleFunc("POST /v1/calls", s.auth(s.create))
 	s.mux.HandleFunc("GET /v1/calls/{id}", s.auth(s.get))
 	s.mux.HandleFunc("POST /v1/calls/{id}/{action}", s.auth(s.mutate))
-	s.mux.Handle("/media", s.media)
+	s.mux.HandleFunc("/media", s.serveMedia)
 	s.registerV2()
 	return s
 }
 func (s *Server) Handler() http.Handler { return securityHeaders(s.mux) }
-func (s *Server) Shutdown()             { s.media.CloseAll("server restart") }
+func (s *Server) Shutdown() {
+	s.media.CloseAll("server restart")
+	if s.accountMedia != nil {
+		s.accountMedia.CloseAll("server restart")
+	}
+}
+
+func (s *Server) serveMedia(w http.ResponseWriter, r *http.Request) {
+	role, side := r.URL.Query().Get("role"), r.URL.Query().Get("side")
+	if (role == "A" || role == "B") && side == "" {
+		s.media.ServeHTTP(w, r)
+		return
+	}
+	if role == "" && (side == string(accountcalls.SideCaller) || side == string(accountcalls.SideCallee)) && s.accountMedia != nil {
+		s.accountMedia.ServeHTTP(w, r)
+		return
+	}
+	http.Error(w, "invalid media participant", http.StatusBadRequest)
+}
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	_, a := s.devices.Get("A")
 	_, b := s.devices.Get("B")

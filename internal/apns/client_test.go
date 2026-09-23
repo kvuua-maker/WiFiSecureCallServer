@@ -108,3 +108,48 @@ func TestIPhoneAlertFallbackDoesNotGainWatchBackgroundAugmentation(t *testing.T)
 		t.Fatalf("iPhone alert headers changed: %#v", captured.header)
 	}
 }
+
+func TestAccountIncomingCallTopicsAndPayload(t *testing.T) {
+	tests := []struct {
+		name, platform, pushType, topic string
+		background                      bool
+	}{
+		{"iOS VoIP", "iOS", "voip", "com.vkapps.wifisecurecall.voip", true},
+		{"iOS alert", "iOS", "alert", "com.vkapps.wifisecurecall", false},
+		{"Watch alert", "watchOS", "alert", "com.vkapps.wifisecurecall.watchkitapp", true},
+		{"Watch VoIP", "watchOS", "voip", "com.vkapps.wifisecurecall.watchkitapp.voip", true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var captured capturedAPNSRequest
+			client := testClient(t, &captured)
+			callID := "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+			accountID := "11111111-2222-4333-8444-555555555555"
+			if _, err := client.IncomingAccountCall(context.Background(), test.platform, "0123456789abcdef", callID, test.pushType, time.Now().Add(30*time.Second), accountID); err != nil {
+				t.Fatal(err)
+			}
+			if captured.header.Get("apns-topic") != test.topic || captured.header.Get("apns-push-type") != test.pushType || captured.header.Get("apns-priority") != "10" {
+				t.Fatalf("headers=%v", captured.header)
+			}
+			aps, ok := captured.payload["aps"].(map[string]any)
+			if !ok {
+				t.Fatal("missing aps")
+			}
+			_, hasBackground := aps["content-available"]
+			if hasBackground != test.background {
+				t.Fatalf("content-available present=%v", hasBackground)
+			}
+			if test.pushType == "alert" && (aps["sound"] != "default" || aps["category"] != "INCOMING_CALL") {
+				t.Fatalf("visible alert changed: %#v", aps)
+			}
+			if captured.payload["event"] != "incoming_call_v2" || captured.payload["serverCallID"] != callID || captured.payload["accountID"] != accountID {
+				t.Fatalf("payload=%#v", captured.payload)
+			}
+			for _, forbidden := range []string{"phoneNumber", "mediaToken", "accessToken", "refreshToken"} {
+				if _, exists := captured.payload[forbidden]; exists {
+					t.Fatalf("payload exposed %s", forbidden)
+				}
+			}
+		})
+	}
+}

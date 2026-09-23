@@ -24,6 +24,9 @@ type Sender interface {
 	IncomingCall(context.Context, string, string, string, string, time.Time) (Result, error)
 	Configured() bool
 }
+type AccountSender interface {
+	IncomingAccountCall(context.Context, string, string, string, string, time.Time, string) (Result, error)
+}
 type Result struct {
 	Status                            int
 	Reason, APNSID                    string
@@ -33,6 +36,9 @@ type Result struct {
 type Disabled struct{}
 
 func (Disabled) IncomingCall(context.Context, string, string, string, string, time.Time) (Result, error) {
+	return Result{}, errors.New("APNs disabled")
+}
+func (Disabled) IncomingAccountCall(context.Context, string, string, string, string, time.Time, string) (Result, error) {
 	return Result{}, errors.New("APNs disabled")
 }
 func (Disabled) Configured() bool { return false }
@@ -84,6 +90,88 @@ func (c *Client) IncomingCall(ctx context.Context, role, deviceToken, callID, pu
 		return c.incomingCall(ctx, role, deviceToken, callID, pushType, ringExpiresAt)
 	}
 	return result, err
+}
+
+func (c *Client) IncomingAccountCall(ctx context.Context, platform, deviceToken, callID, pushType string, ringExpiresAt time.Time, accountID string) (Result, error) {
+	result, err := c.incomingAccountCall(ctx, platform, deviceToken, callID, pushType, ringExpiresAt, accountID)
+	if result.Reason == "ExpiredProviderToken" {
+		c.mu.Lock()
+		c.jwt = ""
+		c.jwtAt = time.Time{}
+		c.mu.Unlock()
+		return c.incomingAccountCall(ctx, platform, deviceToken, callID, pushType, ringExpiresAt, accountID)
+	}
+	return result, err
+}
+
+func (c *Client) incomingAccountCall(ctx context.Context, platform, deviceToken, callID, pushType string, ringExpiresAt time.Time, accountID string) (Result, error) {
+	topic := c.topicIOSAlert
+	if platform == "watchOS" {
+		topic = c.topicWatchAlert
+	}
+	expiration, priority := ringExpiresAt.Unix(), "10"
+	bodyValue := map[string]any{
+		"aps": map[string]any{
+			"alert": map[string]string{"title": "WiFi Secure Call", "body": "Incoming Wi-Fi call"},
+			"sound": "default", "category": "INCOMING_CALL", "interruption-level": "time-sensitive",
+		},
+		"event": "incoming_call_v2", "serverCallID": callID, "accountID": accountID,
+	}
+	if platform == "watchOS" && pushType == "alert" {
+		bodyValue["aps"].(map[string]any)["content-available"] = 1
+	}
+	if pushType == "voip" {
+		expiration = 0
+		bodyValue = map[string]any{"aps": map[string]any{"content-available": 1}, "event": "incoming_call_v2", "serverCallID": callID, "accountID": accountID}
+		if platform == "watchOS" {
+			topic = c.topicWatchVoIP
+		} else {
+			topic = c.topicIOSVoIP
+		}
+	}
+	body, _ := json.Marshal(bodyValue)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.push.apple.com/3/device/"+deviceToken, strings.NewReader(string(body)))
+	if err != nil {
+		return Result{}, err
+	}
+	token, err := c.bearer()
+	if err != nil {
+		return Result{}, err
+	}
+	req.Header.Set("authorization", "bearer "+token)
+	req.Header.Set("apns-topic", topic)
+	req.Header.Set("apns-push-type", pushType)
+	req.Header.Set("apns-priority", priority)
+	req.Header.Set("apns-expiration", fmt.Sprint(expiration))
+	req.Header.Set("content-type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return Result{}, err
+	}
+	defer resp.Body.Close()
+	reason := "Success"
+	var apnsTimestamp time.Time
+	if resp.StatusCode/100 != 2 {
+		var payload struct {
+			Reason    string `json:"reason"`
+			Timestamp int64  `json:"timestamp"`
+		}
+		limited, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if json.Unmarshal(limited, &payload) == nil && payload.Reason != "" {
+			reason = payload.Reason
+		} else {
+			reason = "Unknown"
+		}
+		if payload.Timestamp > 0 {
+			apnsTimestamp = time.UnixMilli(payload.Timestamp).UTC()
+		}
+	}
+	slog.Info("APNs account incoming-call response", "callID", callID, "destinationPlatform", platform, "tokenLength", len(deviceToken), "topic", topic, "pushType", pushType, "priority", priority, "expiration", expiration, "status", resp.StatusCode, "reason", reason, "apnsID", resp.Header.Get("apns-id"))
+	result := Result{Status: resp.StatusCode, Reason: reason, APNSID: resp.Header.Get("apns-id"), Timestamp: apnsTimestamp, Retryable: resp.StatusCode == 429 || resp.StatusCode >= 500, DeadToken: resp.StatusCode == 410 || reason == "BadDeviceToken" || reason == "DeviceTokenNotForTopic" || reason == "Unregistered", AuthFailure: reason == "ExpiredProviderToken" || reason == "InvalidProviderToken"}
+	if resp.StatusCode/100 != 2 {
+		return result, fmt.Errorf("APNs status %d reason %s", resp.StatusCode, reason)
+	}
+	return result, nil
 }
 
 func (c *Client) incomingCall(ctx context.Context, role, deviceToken, callID, pushType string, ringExpiresAt time.Time) (Result, error) {
