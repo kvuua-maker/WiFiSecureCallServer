@@ -476,6 +476,131 @@ func TestSMSDisabledPreservesExistingSessionsAndWatchLinking(t *testing.T) {
 	}
 }
 
+func TestAccountDeviceRegistrationGenerationAndInvalidation(t *testing.T) {
+	f := newFixture(t, 100)
+	account := f.register(t, phoneOne, deviceOne)
+	identity, err := f.svc.Authenticate(account.AccessToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caps := accounts.DeviceCapabilities{VoIPPush: true, AlertPush: true, NotificationsAuthorized: true, MicrophoneReady: true}
+	register := func(pushType, token, invalidated string, generation uint64, environment string) error {
+		return f.svc.RegisterDevice(identity, DeviceRegistration{RequestID: newUUID(t), DeviceID: deviceOne, Platform: "iOS", PushType: pushType, Token: token, InvalidatedToken: invalidated, InstallationGeneration: generation, Environment: environment, Capabilities: caps})
+	}
+	if err := register("alert", "aabb", "", 1, "production"); err != nil {
+		t.Fatal(err)
+	}
+	if err := register("voip", "ccdd", "", 1, "production"); err != nil {
+		t.Fatal(err)
+	}
+	devices := f.svc.DevicesForAccount(identity.AccountID)
+	if len(devices) != 1 || devices[0].AlertToken != "aabb" || devices[0].VoIPToken != "ccdd" {
+		t.Fatalf("same-generation tokens=%+v", devices)
+	}
+	if err := register("alert", "1122", "", 2, "production"); err != nil {
+		t.Fatal(err)
+	}
+	devices = f.svc.DevicesForAccount(identity.AccountID)
+	if devices[0].AlertToken != "1122" || devices[0].VoIPToken != "" || devices[0].InstallationGeneration != 2 {
+		t.Fatalf("higher generation did not clear stale tokens: %+v", devices[0])
+	}
+	if err := register("alert", "eeff", "", 1, "production"); errorStatus(err) != 409 {
+		t.Fatalf("stale generation status=%d", errorStatus(err))
+	}
+	if err := register("voip", "3344", "", 2, "production"); err != nil {
+		t.Fatal(err)
+	}
+	if err := register("alert", "5566", "", 2, "development"); err != nil {
+		t.Fatal(err)
+	}
+	devices = f.svc.DevicesForAccount(identity.AccountID)
+	if devices[0].Environment != "development" || devices[0].AlertToken != "5566" || devices[0].VoIPToken != "" {
+		t.Fatalf("environment replacement unsafe: %+v", devices[0])
+	}
+	if err := register("alert", "not-hex", "", 2, "development"); errorStatus(err) != 400 {
+		t.Fatalf("invalid token status=%d", errorStatus(err))
+	}
+	if err := register("alert", "", "ffff", 2, "development"); err != nil {
+		t.Fatal(err)
+	}
+	if f.svc.DevicesForAccount(identity.AccountID)[0].AlertToken != "5566" {
+		t.Fatal("mismatched invalidation erased current token")
+	}
+	if err := register("alert", "", "5566", 2, "development"); err != nil {
+		t.Fatal(err)
+	}
+	if f.svc.DevicesForAccount(identity.AccountID)[0].AlertToken != "" {
+		t.Fatal("matching invalidation did not clear alert token")
+	}
+}
+
+func TestAccountDeviceIdentityIsolationAndWatchRegistration(t *testing.T) {
+	f := newFixture(t, 100)
+	first := f.register(t, phoneOne, deviceOne)
+	f.advance(121 * time.Second)
+	second := f.register(t, phoneTwo, deviceOne)
+	firstIdentity, _ := f.svc.Authenticate(first.AccessToken)
+	secondIdentity, _ := f.svc.Authenticate(second.AccessToken)
+	caps := accounts.DeviceCapabilities{VoIPPush: true, AlertPush: true, NotificationsAuthorized: true, MicrophoneReady: true}
+	registration := DeviceRegistration{RequestID: newUUID(t), DeviceID: deviceOne, Platform: "iOS", PushType: "voip", Token: "aabb", InstallationGeneration: 1, Environment: "production", Capabilities: caps}
+	if err := f.svc.RegisterDevice(firstIdentity, registration); err != nil {
+		t.Fatal(err)
+	}
+	registration.RequestID = newUUID(t)
+	registration.Token = "ccdd"
+	if err := f.svc.RegisterDevice(secondIdentity, registration); err != nil {
+		t.Fatal(err)
+	}
+	if f.svc.DevicesForAccount(firstIdentity.AccountID)[0].VoIPToken != "aabb" || f.svc.DevicesForAccount(secondIdentity.AccountID)[0].VoIPToken != "ccdd" {
+		t.Fatal("same physical device account registrations were not isolated")
+	}
+	registration.RequestID = newUUID(t)
+	registration.DeviceID = "99999999-2222-4333-8444-555555555555"
+	if err := f.svc.RegisterDevice(firstIdentity, registration); errorStatus(err) != 403 {
+		t.Fatalf("foreign device status=%d", errorStatus(err))
+	}
+	registration.DeviceID = deviceOne
+	registration.Platform = "watchOS"
+	if err := f.svc.RegisterDevice(firstIdentity, registration); errorStatus(err) != 403 {
+		t.Fatalf("platform mismatch status=%d", errorStatus(err))
+	}
+
+	watchID := "33333333-2222-4333-8444-555555555555"
+	link, err := f.svc.WatchStart(newUUID(t), watchID, "watchOS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.svc.WatchClaim(firstIdentity, newUUID(t), link.Code); err != nil {
+		t.Fatal(err)
+	}
+	watchSession, err := f.svc.WatchStatus(link.LinkID, link.LinkSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	watchIdentity, err := f.svc.Authenticate(watchSession.AccessToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.svc.RegisterDevice(watchIdentity, DeviceRegistration{RequestID: newUUID(t), DeviceID: watchID, Platform: "watchOS", PushType: "alert", Token: "eeff", InstallationGeneration: 1, Environment: "production", Capabilities: caps}); err != nil {
+		t.Fatal(err)
+	}
+	watchFound := false
+	for _, device := range f.svc.DevicesForAccount(firstIdentity.AccountID) {
+		if device.DeviceID == watchID && device.AlertToken == "eeff" {
+			watchFound = true
+		}
+	}
+	if !watchFound {
+		t.Fatal("Watch account token not registered")
+	}
+	if err := f.svc.DeleteAccount(firstIdentity); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.svc.DevicesForAccount(firstIdentity.AccountID)) != 0 || len(f.svc.DevicesForAccount(secondIdentity.AccountID)) != 1 {
+		t.Fatal("account deletion crossed device ownership")
+	}
+}
+
 func TestRateLimitRetryAtUsesActualRollingWindows(t *testing.T) {
 	now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
 	base := accounts.State{Verifications: map[string]accounts.Verification{}}

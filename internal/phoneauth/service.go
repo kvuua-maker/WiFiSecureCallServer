@@ -36,9 +36,10 @@ func (e *ServiceError) Error() string { return e.Code }
 func tooMany(code string, retry time.Time) *ServiceError {
 	return &ServiceError{Status: 429, Code: code, RetryAt: retry}
 }
-func bad(code string) *ServiceError      { return &ServiceError{Status: 400, Code: code} }
-func conflict(code string) *ServiceError { return &ServiceError{Status: 409, Code: code} }
-func unauthorized() *ServiceError        { return &ServiceError{Status: 401, Code: "unauthorized"} }
+func bad(code string) *ServiceError       { return &ServiceError{Status: 400, Code: code} }
+func conflict(code string) *ServiceError  { return &ServiceError{Status: 409, Code: code} }
+func unauthorized() *ServiceError         { return &ServiceError{Status: 401, Code: "unauthorized"} }
+func forbidden(code string) *ServiceError { return &ServiceError{Status: 403, Code: code} }
 
 type Service struct {
 	store              *accounts.Store
@@ -80,6 +81,18 @@ type WatchStatusResult struct {
 	AccessExpiresAt  time.Time `json:"accessExpiresAt,omitempty"`
 	RefreshToken     string    `json:"refreshToken,omitempty"`
 	RefreshExpiresAt time.Time `json:"refreshExpiresAt,omitempty"`
+}
+
+type DeviceRegistration struct {
+	RequestID              string
+	DeviceID               string
+	Platform               string
+	PushType               string
+	Token                  string
+	InvalidatedToken       string
+	InstallationGeneration uint64
+	Environment            string
+	Capabilities           accounts.DeviceCapabilities
 }
 
 func New(store *accounts.Store, sender SMSSender, pepper string, maxDaily int) (*Service, error) {
@@ -336,6 +349,93 @@ func (s *Service) DeleteAccount(identity Identity) error {
 	})
 }
 
+func (s *Service) RegisterDevice(identity Identity, registration DeviceRegistration) error {
+	if !validUUID(registration.RequestID) || !validUUID(registration.DeviceID) || (registration.Platform != "iOS" && registration.Platform != "watchOS") || (registration.PushType != "alert" && registration.PushType != "voip") {
+		return bad("invalid device registration")
+	}
+	deviceID := strings.ToLower(registration.DeviceID)
+	if deviceID != strings.ToLower(identity.DeviceID) || registration.Platform != identity.Platform {
+		return forbidden("device identity mismatch")
+	}
+	if registration.Token != "" {
+		if !validAPNSToken(registration.Token) || registration.InstallationGeneration == 0 || (registration.Environment != "production" && registration.Environment != "development") {
+			return bad("invalid device registration")
+		}
+	}
+	if registration.InvalidatedToken != "" && !validAPNSToken(registration.InvalidatedToken) {
+		return bad("invalid device registration")
+	}
+	now := s.now()
+	return s.store.Update(func(state *accounts.State) error {
+		index := -1
+		for i := range state.Devices {
+			if state.Devices[i].AccountID == identity.AccountID && state.Devices[i].DeviceID == deviceID {
+				index = i
+				break
+			}
+		}
+		if index < 0 {
+			if registration.Token == "" {
+				return nil
+			}
+			state.Devices = append(state.Devices, accounts.Device{AccountID: identity.AccountID, DeviceID: deviceID, Platform: identity.Platform, CreatedAt: now, LastSeenAt: now})
+			index = len(state.Devices) - 1
+		}
+		device := state.Devices[index]
+		if registration.Token == "" {
+			if registration.InstallationGeneration != device.InstallationGeneration {
+				return nil
+			}
+			if registration.PushType == "alert" {
+				if registration.InvalidatedToken == "" || constantStringEqual(registration.InvalidatedToken, device.AlertToken) {
+					device.AlertToken = ""
+					device.AlertUpdatedAt = time.Time{}
+				}
+			} else if registration.InvalidatedToken == "" || constantStringEqual(registration.InvalidatedToken, device.VoIPToken) {
+				device.VoIPToken = ""
+				device.VoIPUpdatedAt = time.Time{}
+			}
+			device.LastSeenAt = now
+			state.Devices[index] = device
+			return nil
+		}
+		if registration.InstallationGeneration < device.InstallationGeneration {
+			return conflict("stale installation generation")
+		}
+		if registration.InstallationGeneration > device.InstallationGeneration || device.Environment != "" && device.Environment != registration.Environment {
+			device.AlertToken = ""
+			device.VoIPToken = ""
+			device.AlertUpdatedAt = time.Time{}
+			device.VoIPUpdatedAt = time.Time{}
+		}
+		device.InstallationGeneration = registration.InstallationGeneration
+		device.Environment = registration.Environment
+		device.Capabilities = registration.Capabilities
+		device.Platform = registration.Platform
+		device.LastSeenAt = now
+		if registration.PushType == "alert" {
+			device.AlertToken = strings.ToLower(registration.Token)
+			device.AlertUpdatedAt = now
+		} else {
+			device.VoIPToken = strings.ToLower(registration.Token)
+			device.VoIPUpdatedAt = now
+		}
+		state.Devices[index] = device
+		return nil
+	})
+}
+
+func (s *Service) DevicesForAccount(accountID string) []accounts.Device {
+	state := s.store.Snapshot()
+	result := make([]accounts.Device, 0)
+	for _, device := range state.Devices {
+		if device.AccountID == accountID {
+			result = append(result, device)
+		}
+	}
+	return result
+}
+
 func (s *Service) WatchStart(requestID, deviceID, platform string) (WatchStartResult, error) {
 	if !validUUID(requestID) || !validUUID(deviceID) || platform != "watchOS" {
 		return WatchStartResult{}, bad("invalid request")
@@ -571,4 +671,20 @@ func maskPhone(phone string) string {
 		return "••••"
 	}
 	return phone[:2] + strings.Repeat("•", len(phone)-6) + phone[len(phone)-4:]
+}
+
+func validAPNSToken(value string) bool {
+	if value == "" || len(value) > 512 || len(value)%2 != 0 {
+		return false
+	}
+	for _, character := range value {
+		if !(character >= '0' && character <= '9' || character >= 'a' && character <= 'f' || character >= 'A' && character <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+func constantStringEqual(left, right string) bool {
+	return len(left) == len(right) && subtle.ConstantTimeCompare([]byte(left), []byte(right)) == 1
 }

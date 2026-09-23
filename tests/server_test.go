@@ -184,6 +184,33 @@ func TestSMSDisabledKeepsExistingV2SessionsAndRoutesAvailable(t *testing.T) {
 	if me["accountID"] != account.Account.AccountID || me["deviceID"] != account.DeviceID {
 		t.Fatalf("me=%v", me)
 	}
+	registration := map[string]any{
+		"requestID": "10000000-0000-4000-8000-000000000008", "deviceID": account.DeviceID, "platform": "iOS",
+		"pushType": "alert", "token": "aabbccdd", "installationGeneration": 1, "environment": "production",
+		"capabilities": map[string]bool{"voipPush": true, "alertPush": true, "notificationsAuthorized": true, "microphoneReady": true},
+	}
+	registrationResponse := request(t, srv.URL, http.MethodPost, "/v2/devices/register", refreshed.AccessToken, registration)
+	if registrationResponse.StatusCode != http.StatusNoContent {
+		t.Fatalf("device registration status=%d", registrationResponse.StatusCode)
+	}
+	registrationResponse.Body.Close()
+	devicesForAccount := disabled.DevicesForAccount(account.Account.AccountID)
+	if len(devicesForAccount) != 1 || devicesForAccount[0].AlertToken != "aabbccdd" {
+		t.Fatalf("account device not registered: %+v", devicesForAccount)
+	}
+	registration["deviceID"] = "99999999-0000-4000-8000-000000000009"
+	foreignResponse := request(t, srv.URL, http.MethodPost, "/v2/devices/register", refreshed.AccessToken, registration)
+	if foreignResponse.StatusCode != http.StatusForbidden {
+		t.Fatalf("foreign device status=%d", foreignResponse.StatusCode)
+	}
+	foreignResponse.Body.Close()
+	registration["deviceID"] = account.DeviceID
+	registration["platform"] = "watchOS"
+	platformResponse := request(t, srv.URL, http.MethodPost, "/v2/devices/register", refreshed.AccessToken, registration)
+	if platformResponse.StatusCode != http.StatusForbidden {
+		t.Fatalf("platform mismatch status=%d", platformResponse.StatusCode)
+	}
+	platformResponse.Body.Close()
 
 	watchStart := request(t, srv.URL, http.MethodPost, "/v2/watch-link/start", "", map[string]string{"requestID": "10000000-0000-4000-8000-000000000005", "deviceID": "10000000-0000-4000-8000-000000000006", "platform": "watchOS"})
 	if watchStart.StatusCode != http.StatusOK {

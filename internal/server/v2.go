@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/accounts"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/phoneauth"
 )
 
@@ -23,6 +24,41 @@ func (s *Server) registerV2() {
 	s.mux.HandleFunc("POST /v2/watch-link/start", s.watchLinkStart)
 	s.mux.HandleFunc("POST /v2/watch-link/claim", s.v2Auth(s.watchLinkClaim))
 	s.mux.HandleFunc("POST /v2/watch-link/status", s.watchLinkStatus)
+	s.mux.HandleFunc("POST /v2/devices/register", s.v2Auth(s.v2RegisterDevice))
+}
+
+type v2DeviceCapabilities struct {
+	VoIPPush                bool
+	AlertPush               bool
+	NotificationsAuthorized bool
+	MicrophoneReady         bool
+}
+
+type v2DeviceRegistrationRequest struct {
+	RequestID, DeviceID, Platform, PushType, Token, InvalidatedToken, Environment string
+	InstallationGeneration                                                        uint64
+	Capabilities                                                                  v2DeviceCapabilities
+}
+
+func (s *Server) v2RegisterDevice(w http.ResponseWriter, r *http.Request) {
+	var body v2DeviceRegistrationRequest
+	if err := decode(w, r, &body); err != nil {
+		writeDecodeError(w, err, "invalid device registration")
+		return
+	}
+	err := s.phoneAuth.RegisterDevice(identityFrom(r.Context()), phoneauth.DeviceRegistration{
+		RequestID: body.RequestID, DeviceID: body.DeviceID, Platform: body.Platform, PushType: body.PushType,
+		Token: body.Token, InvalidatedToken: body.InvalidatedToken, InstallationGeneration: body.InstallationGeneration,
+		Environment: body.Environment, Capabilities: accounts.DeviceCapabilities{
+			VoIPPush: body.Capabilities.VoIPPush, AlertPush: body.Capabilities.AlertPush,
+			NotificationsAuthorized: body.Capabilities.NotificationsAuthorized, MicrophoneReady: body.Capabilities.MicrophoneReady,
+		},
+	})
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 type phoneStartRequest struct{ RequestID, PhoneNumber string }

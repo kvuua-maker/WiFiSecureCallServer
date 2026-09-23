@@ -1,10 +1,12 @@
 package accounts
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"time"
 )
@@ -19,11 +21,25 @@ type Account struct {
 }
 
 type Device struct {
-	AccountID  string    `json:"accountID"`
-	DeviceID   string    `json:"deviceID"`
-	Platform   string    `json:"platform"`
-	CreatedAt  time.Time `json:"createdAt"`
-	LastSeenAt time.Time `json:"lastSeenAt"`
+	AccountID              string             `json:"accountID"`
+	DeviceID               string             `json:"deviceID"`
+	Platform               string             `json:"platform"`
+	CreatedAt              time.Time          `json:"createdAt"`
+	LastSeenAt             time.Time          `json:"lastSeenAt"`
+	InstallationGeneration uint64             `json:"installationGeneration,omitempty"`
+	Environment            string             `json:"environment,omitempty"`
+	AlertToken             string             `json:"alertToken,omitempty"`
+	VoIPToken              string             `json:"voipToken,omitempty"`
+	AlertUpdatedAt         time.Time          `json:"alertUpdatedAt,omitempty"`
+	VoIPUpdatedAt          time.Time          `json:"voipUpdatedAt,omitempty"`
+	Capabilities           DeviceCapabilities `json:"capabilities,omitempty"`
+}
+
+type DeviceCapabilities struct {
+	VoIPPush                bool `json:"voipPush"`
+	AlertPush               bool `json:"alertPush"`
+	NotificationsAuthorized bool `json:"notificationsAuthorized"`
+	MicrophoneReady         bool `json:"microphoneReady"`
 }
 
 type Session struct {
@@ -136,7 +152,39 @@ func validateState(s State) error {
 		}
 		phones[account.PhoneE164] = id
 	}
+	devices := make(map[string]struct{}, len(s.Devices))
+	for _, device := range s.Devices {
+		account, exists := s.Accounts[device.AccountID]
+		if !exists || account.Status != "active" || !validUUID(device.DeviceID) || (device.Platform != "iOS" && device.Platform != "watchOS") {
+			return errors.New("invalid account device state")
+		}
+		key := device.AccountID + "\x00" + device.DeviceID
+		if _, exists := devices[key]; exists {
+			return errors.New("duplicate account device state")
+		}
+		devices[key] = struct{}{}
+		if device.Environment != "" && device.Environment != "production" && device.Environment != "development" {
+			return errors.New("invalid account device environment")
+		}
+		if device.AlertToken != "" && !validAPNSToken(device.AlertToken) || device.VoIPToken != "" && !validAPNSToken(device.VoIPToken) {
+			return errors.New("invalid account device token")
+		}
+		if (device.AlertToken != "" || device.VoIPToken != "") && (device.InstallationGeneration == 0 || device.Environment == "") {
+			return errors.New("invalid account device generation")
+		}
+	}
 	return nil
+}
+
+var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+func validUUID(value string) bool { return uuidPattern.MatchString(value) }
+func validAPNSToken(value string) bool {
+	if value == "" || len(value) > 512 || len(value)%2 != 0 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 func (s *Store) Snapshot() State {
