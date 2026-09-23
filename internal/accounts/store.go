@@ -126,10 +126,15 @@ func validateState(s State) error {
 	if s.SchemaVersion != SchemaVersion || s.Accounts == nil || s.Sessions == nil || s.Verifications == nil || s.StartIdempotency == nil || s.WatchStartIdempotency == nil || s.WatchLinks == nil {
 		return errors.New("unsupported account state schema")
 	}
+	phones := make(map[string]string, len(s.Accounts))
 	for id, account := range s.Accounts {
 		if id == "" || account.AccountID != id || account.PhoneE164 == "" || account.Status != "active" {
 			return errors.New("invalid account state")
 		}
+		if previous, exists := phones[account.PhoneE164]; exists && previous != id {
+			return errors.New("duplicate active account phone")
+		}
+		phones[account.PhoneE164] = id
 	}
 	return nil
 }

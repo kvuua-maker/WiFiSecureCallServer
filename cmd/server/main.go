@@ -45,13 +45,17 @@ func main() {
 	}
 	callStore := calls.New(cfg.RingTimeout, 0)
 	server := appserver.New(cfg.TokenA, cfg.TokenB, callStore, deviceStore, push)
-	if cfg.SMSProvider == "smsclub" {
+	if cfg.AccountAuthEnabled {
 		accountStore, e := accounts.Open(cfg.AccountStatePath)
 		if e != nil {
 			slog.Error("account state failed", "error", e)
 			os.Exit(1)
 		}
-		auth, e := phoneauth.New(accountStore, smsclub.New(cfg.SMSClubToken, cfg.SMSClubOriginator), cfg.OTPPepper, cfg.SMSMaxSendsPerDay)
+		var sender phoneauth.SMSSender
+		if cfg.SMSProvider == "smsclub" {
+			sender = smsclub.New(cfg.SMSClubToken, cfg.SMSClubOriginator)
+		}
+		auth, e := phoneauth.New(accountStore, sender, cfg.OTPPepper, cfg.SMSMaxSendsPerDay)
 		if e != nil {
 			slog.Error("phone authentication configuration failed", "error", e)
 			os.Exit(1)

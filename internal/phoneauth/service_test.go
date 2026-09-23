@@ -269,6 +269,70 @@ func TestConsumedOTPAndAccessExpiry(t *testing.T) {
 	}
 }
 
+func TestConcurrentVerificationUsesOneAccountPerPhone(t *testing.T) {
+	f := newFixture(t, 100)
+	code := "123456"
+	verificationIDs := []string{newUUID(t), newUUID(t)}
+	if err := f.store.Update(func(state *accounts.State) error {
+		for _, id := range verificationIDs {
+			state.Verifications[id] = accounts.Verification{
+				VerificationID: id, PhoneE164: phoneOne, SourceIP: "192.0.2.1",
+				OTPHash: f.svc.hmac(id, phoneOne, code), CreatedAt: f.now,
+				ExpiresAt: f.now.Add(10 * time.Minute), ResendAfter: f.now.Add(120 * time.Second),
+				ProviderAttempted: true, ProviderSubmitted: true,
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	results := make(chan SessionResult, 2)
+	errors := make(chan error, 2)
+	var group sync.WaitGroup
+	for index, id := range verificationIDs {
+		group.Add(1)
+		go func(index int, id string) {
+			defer group.Done()
+			device := []string{deviceOne, "22222222-2222-4333-8444-555555555555"}[index]
+			result, err := f.svc.Verify(newUUID(t), id, code, device, "iOS")
+			if err != nil {
+				errors <- err
+				return
+			}
+			results <- result
+		}(index, id)
+	}
+	group.Wait()
+	close(results)
+	close(errors)
+	for err := range errors {
+		t.Fatal(err)
+	}
+	var accountID string
+	count := 0
+	for result := range results {
+		count++
+		if accountID == "" {
+			accountID = result.Account.AccountID
+		} else if result.Account.AccountID != accountID {
+			t.Fatalf("different AccountIDs: %s and %s", accountID, result.Account.AccountID)
+		}
+	}
+	if count != 2 {
+		t.Fatalf("successful verifications=%d", count)
+	}
+	phoneAccounts := 0
+	for _, account := range f.store.Snapshot().Accounts {
+		if account.PhoneE164 == phoneOne {
+			phoneAccounts++
+		}
+	}
+	if phoneAccounts != 1 {
+		t.Fatalf("accounts for phone=%d", phoneAccounts)
+	}
+}
+
 func TestWatchLinkLifecycle(t *testing.T) {
 	f := newFixture(t, 100)
 	account := f.register(t, phoneOne, deviceOne)
@@ -316,6 +380,141 @@ func TestWatchLinkLifecycle(t *testing.T) {
 	expired, _ := f.svc.WatchStatus(link2.LinkID, link2.LinkSecret)
 	if expired.Status != "expired" {
 		t.Fatal(expired.Status)
+	}
+}
+
+func TestWatchLinkCodeCollisionAndExpiredReuse(t *testing.T) {
+	f := newFixture(t, 100)
+	codes := []string{"123456", "123456", "654321"}
+	index := 0
+	f.svc.SetWatchCodeGeneratorForTesting(func() (string, error) {
+		value := codes[index]
+		index++
+		return value, nil
+	})
+	first, err := f.svc.WatchStart(newUUID(t), "33333333-2222-4333-8444-555555555555", "watchOS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := f.svc.WatchStart(newUUID(t), "44444444-2222-4333-8444-555555555555", "watchOS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Code != "123456" || second.Code != "654321" || index != 3 {
+		t.Fatalf("collision was not retried: first=%s second=%s attempts=%d", first.Code, second.Code, index)
+	}
+
+	f.advance(6 * time.Minute)
+	f.svc.SetWatchCodeGeneratorForTesting(func() (string, error) { return "123456", nil })
+	reused, err := f.svc.WatchStart(newUUID(t), "55555555-2222-4333-8444-555555555555", "watchOS")
+	if err != nil || reused.Code != "123456" {
+		t.Fatalf("expired code blocked reuse: %+v %v", reused, err)
+	}
+}
+
+func TestWatchClaimRejectsAmbiguousCode(t *testing.T) {
+	f := newFixture(t, 100)
+	account := f.register(t, phoneOne, deviceOne)
+	identity, err := f.svc.Authenticate(account.AccessToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := "123456"
+	if err := f.store.Update(func(state *accounts.State) error {
+		for index, id := range []string{"33333333-2222-4333-8444-555555555555", "44444444-2222-4333-8444-555555555555"} {
+			device := []string{"55555555-2222-4333-8444-555555555555", "66666666-2222-4333-8444-555555555555"}[index]
+			state.WatchLinks[id] = accounts.WatchLink{LinkID: id, DeviceID: device, Platform: "watchOS", CodeHash: f.svc.hmac(id, device, code), SecretHash: tokenHash("secret" + id), CreatedAt: f.now, ExpiresAt: f.now.Add(5 * time.Minute)}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.svc.WatchClaim(identity, newUUID(t), code); errorStatus(err) != 503 {
+		t.Fatalf("ambiguous code status=%d err=%v", errorStatus(err), err)
+	}
+	for _, link := range f.store.Snapshot().WatchLinks {
+		if link.ClaimedAt != nil {
+			t.Fatal("ambiguous link was claimed")
+		}
+	}
+}
+
+func TestSMSDisabledPreservesExistingSessionsAndWatchLinking(t *testing.T) {
+	f := newFixture(t, 100)
+	account := f.register(t, phoneOne, deviceOne)
+	disabled, err := New(f.store, nil, testPepper, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabled.SetClockForTesting(func() time.Time { return f.now })
+	if _, err := disabled.Start(context.Background(), newUUID(t), phoneTwo, "192.0.2.2"); errorStatus(err) != 503 {
+		t.Fatalf("disabled sender start status=%d", errorStatus(err))
+	}
+	identity, err := disabled.Authenticate(account.AccessToken)
+	if err != nil || identity.AccountID != account.Account.AccountID {
+		t.Fatalf("existing access session failed: %+v %v", identity, err)
+	}
+	rotated, err := disabled.Refresh(account.RefreshToken, deviceOne)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err = disabled.Authenticate(rotated.AccessToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabled.SetWatchCodeGeneratorForTesting(func() (string, error) { return "123456", nil })
+	link, err := disabled.WatchStart(newUUID(t), "33333333-2222-4333-8444-555555555555", "watchOS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := disabled.WatchClaim(identity, newUUID(t), link.Code); err != nil {
+		t.Fatal(err)
+	}
+	status, err := disabled.WatchStatus(link.LinkID, link.LinkSecret)
+	if err != nil || status.Status != "claimed" || status.AccessToken == "" {
+		t.Fatalf("watch link unavailable with SMS disabled: %+v %v", status, err)
+	}
+}
+
+func TestRateLimitRetryAtUsesActualRollingWindows(t *testing.T) {
+	now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+	base := accounts.State{Verifications: map[string]accounts.Verification{}}
+	for i, age := range []time.Duration{9 * time.Minute, 8 * time.Minute, 7 * time.Minute} {
+		id := fmtDigits(i, 1)
+		base.Verifications[id] = accounts.Verification{PhoneE164: phoneOne, SourceIP: "192.0.2." + fmtDigits(i+1, 1), CreatedAt: now.Add(-age), ProviderSubmitted: true}
+	}
+	limited := rateLimit(base, phoneOne, "198.51.100.1", now, 100)
+	if limited == nil || !limited.RetryAt.Equal(now.Add(time.Minute)) {
+		t.Fatalf("10m retryAt=%v", limited)
+	}
+
+	daily := accounts.State{Verifications: map[string]accounts.Verification{}}
+	for i := 0; i < 10; i++ {
+		id := fmtDigits(i, 2)
+		daily.Verifications[id] = accounts.Verification{PhoneE164: phoneOne, SourceIP: "192.0.2." + fmtDigits(i+1, 2), CreatedAt: now.Add(-23*time.Hour + time.Duration(i)*time.Minute), ProviderSubmitted: true}
+	}
+	limited = rateLimit(daily, phoneOne, "198.51.100.1", now, 100)
+	if limited == nil || !limited.RetryAt.Equal(now.Add(time.Hour)) {
+		t.Fatalf("24h retryAt=%v", limited)
+	}
+
+	ipState := accounts.State{Verifications: map[string]accounts.Verification{}}
+	for i := 0; i < 20; i++ {
+		id := fmtDigits(i, 2)
+		ipState.Verifications[id] = accounts.Verification{PhoneE164: "+1415555" + fmtDigits(i, 4), SourceIP: "203.0.113.1", CreatedAt: now.Add(-59*time.Minute + time.Duration(i)*time.Second), ProviderSubmitted: true}
+	}
+	limited = rateLimit(ipState, phoneOne, "203.0.113.1", now, 100)
+	if limited == nil || !limited.RetryAt.Equal(now.Add(time.Minute)) {
+		t.Fatalf("hour retryAt=%v", limited)
+	}
+
+	globalState := accounts.State{Verifications: map[string]accounts.Verification{
+		"one": {PhoneE164: "+14155550101", SourceIP: "192.0.2.10", CreatedAt: now.Add(-23 * time.Hour), ProviderSubmitted: true},
+		"two": {PhoneE164: "+14155550102", SourceIP: "192.0.2.11", CreatedAt: now.Add(-22 * time.Hour), ProviderSubmitted: true},
+	}}
+	limited = rateLimit(globalState, phoneOne, "203.0.113.1", now, 2)
+	if limited == nil || !limited.RetryAt.Equal(now.Add(time.Hour)) {
+		t.Fatalf("global rolling retryAt=%v", limited)
 	}
 }
 

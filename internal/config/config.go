@@ -16,6 +16,7 @@ type Config struct {
 	RingTimeout                                                               time.Duration
 	SMSProvider, SMSClubToken, SMSClubOriginator, AccountStatePath, OTPPepper string
 	SMSMaxSendsPerDay                                                         int
+	AccountAuthEnabled                                                        bool
 }
 
 func Load() (Config, error) {
@@ -43,8 +44,18 @@ func Load() (Config, error) {
 	if c.SMSProvider != "disabled" && c.SMSProvider != "smsclub" {
 		return Config{}, errors.New("invalid SMS_PROVIDER")
 	}
+	accountConfigPresent := c.OTPPepper != "" || os.Getenv("SMS_MAX_SENDS_PER_DAY") != ""
+	if c.SMSProvider == "disabled" && accountConfigPresent {
+		if len(c.OTPPepper) < 32 || c.SMSMaxSendsPerDay <= 0 {
+			return Config{}, errors.New("account authentication configuration is incomplete")
+		}
+		c.AccountAuthEnabled = true
+	}
 	if c.SMSProvider == "smsclub" && (c.SMSClubToken == "" || c.SMSClubOriginator == "" || len(c.OTPPepper) < 32 || c.SMSMaxSendsPerDay <= 0) {
 		return Config{}, errors.New("SMSClub configuration is incomplete")
+	}
+	if c.SMSProvider == "smsclub" {
+		c.AccountAuthEnabled = true
 	}
 	return c, nil
 }

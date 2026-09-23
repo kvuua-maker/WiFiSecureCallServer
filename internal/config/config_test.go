@@ -43,3 +43,21 @@ func TestSMSClubFailsClosedUnlessComplete(t *testing.T) {
 		t.Fatalf("config=%+v", cfg)
 	}
 }
+
+func TestSMSDisabledCanKeepAccountAuthenticationEnabled(t *testing.T) {
+	baseEnvironment(t)
+	t.Setenv("WSC_OTP_PEPPER", "0123456789abcdef0123456789abcdef")
+	t.Setenv("SMS_MAX_SENDS_PER_DAY", "100")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.AccountAuthEnabled || cfg.SMSProvider != "disabled" {
+		t.Fatalf("config=%+v", cfg)
+	}
+
+	t.Setenv("SMS_MAX_SENDS_PER_DAY", "")
+	if _, err := Load(); err == nil {
+		t.Fatal("partial disabled account-auth configuration accepted")
+	}
+}

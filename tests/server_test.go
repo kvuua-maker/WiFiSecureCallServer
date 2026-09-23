@@ -16,9 +16,11 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/accounts"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/apns"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/calls"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/devices"
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/phoneauth"
 	appserver "github.com/kvuua-maker/wifi-secure-call-server/internal/server"
 )
 
@@ -27,6 +29,23 @@ const tokenB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 const callID = "11111111-2222-4333-8444-555555555555"
 
 type pushStub struct{ configured bool }
+
+type v2SMSSender struct {
+	calls int
+	code  string
+}
+
+func (s *v2SMSSender) Send(_ context.Context, _ string, message string) (string, error) {
+	s.calls++
+	for _, field := range strings.Fields(message) {
+		candidate := strings.TrimSuffix(field, ".")
+		if len(candidate) == 6 && candidate[0] >= '0' && candidate[0] <= '9' {
+			s.code = candidate
+			break
+		}
+	}
+	return "provider-id", nil
+}
 
 func (p pushStub) IncomingCall(context.Context, string, string, string, string, time.Time) (apns.Result, error) {
 	return apns.Result{Status: http.StatusOK, Reason: "Success"}, nil
@@ -99,6 +118,87 @@ func TestHealth(t *testing.T) {
 	if value["ok"] != true || value["apnsConfigured"] != false {
 		t.Fatal(value)
 	}
+}
+
+func TestSMSDisabledKeepsExistingV2SessionsAndRoutesAvailable(t *testing.T) {
+	dir := t.TempDir()
+	accountStore, err := accounts.Open(filepath.Join(dir, "accounts.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := &v2SMSSender{}
+	const pepper = "0123456789abcdef0123456789abcdef"
+	enabled, err := phoneauth.New(accountStore, sender, pepper, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, err := enabled.Start(context.Background(), "10000000-0000-4000-8000-000000000001", "+380501234567", "192.0.2.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	account, err := enabled.Verify("10000000-0000-4000-8000-000000000002", start.VerificationID, sender.code, "10000000-0000-4000-8000-000000000003", "iOS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabled, err := phoneauth.New(accountStore, nil, pepper, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deviceStore, err := devices.Open(filepath.Join(dir, "devices.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(appserver.NewWithV2(tokenA, tokenB, calls.New(30*time.Second, 0), deviceStore, pushStub{}, disabled).Handler())
+	defer srv.Close()
+
+	startResponse := request(t, srv.URL, http.MethodPost, "/v2/auth/phone/start", "", map[string]string{"requestID": "10000000-0000-4000-8000-000000000004", "phoneNumber": "+14155550123"})
+	if startResponse.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("phone start status=%d", startResponse.StatusCode)
+	}
+	startResponse.Body.Close()
+	if sender.calls != 1 {
+		t.Fatalf("unexpected SMS calls=%d", sender.calls)
+	}
+
+	refreshResponse := request(t, srv.URL, http.MethodPost, "/v2/auth/refresh", "", map[string]string{"refreshToken": account.RefreshToken, "deviceID": account.DeviceID})
+	if refreshResponse.StatusCode != http.StatusOK {
+		t.Fatalf("refresh status=%d", refreshResponse.StatusCode)
+	}
+	var refreshed struct {
+		AccessToken string `json:"accessToken"`
+	}
+	if err := json.NewDecoder(refreshResponse.Body).Decode(&refreshed); err != nil {
+		t.Fatal(err)
+	}
+	refreshResponse.Body.Close()
+
+	meResponse := request(t, srv.URL, http.MethodGet, "/v2/me", refreshed.AccessToken, nil)
+	if meResponse.StatusCode != http.StatusOK {
+		t.Fatalf("me status=%d", meResponse.StatusCode)
+	}
+	var me map[string]string
+	if err := json.NewDecoder(meResponse.Body).Decode(&me); err != nil {
+		t.Fatal(err)
+	}
+	meResponse.Body.Close()
+	if me["accountID"] != account.Account.AccountID || me["deviceID"] != account.DeviceID {
+		t.Fatalf("me=%v", me)
+	}
+
+	watchStart := request(t, srv.URL, http.MethodPost, "/v2/watch-link/start", "", map[string]string{"requestID": "10000000-0000-4000-8000-000000000005", "deviceID": "10000000-0000-4000-8000-000000000006", "platform": "watchOS"})
+	if watchStart.StatusCode != http.StatusOK {
+		t.Fatalf("watch start status=%d", watchStart.StatusCode)
+	}
+	var link map[string]any
+	if err := json.NewDecoder(watchStart.Body).Decode(&link); err != nil {
+		t.Fatal(err)
+	}
+	watchStart.Body.Close()
+	claim := request(t, srv.URL, http.MethodPost, "/v2/watch-link/claim", refreshed.AccessToken, map[string]string{"requestID": "10000000-0000-4000-8000-000000000007", "code": link["code"].(string)})
+	if claim.StatusCode != http.StatusNoContent {
+		t.Fatalf("watch claim status=%d", claim.StatusCode)
+	}
+	claim.Body.Close()
 }
 
 func TestDeploymentPreservesProductionConfigAndExplicitlyRestarts(t *testing.T) {

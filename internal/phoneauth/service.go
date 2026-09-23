@@ -41,12 +41,13 @@ func conflict(code string) *ServiceError { return &ServiceError{Status: 409, Cod
 func unauthorized() *ServiceError        { return &ServiceError{Status: 401, Code: "unauthorized"} }
 
 type Service struct {
-	store    *accounts.Store
-	sender   SMSSender
-	pepper   []byte
-	maxDaily int
-	now      func() time.Time
-	startMu  sync.Mutex
+	store              *accounts.Store
+	sender             SMSSender
+	pepper             []byte
+	maxDaily           int
+	now                func() time.Time
+	watchCodeGenerator func() (string, error)
+	startMu            sync.Mutex
 }
 
 type StartResult struct {
@@ -85,11 +86,14 @@ func New(store *accounts.Store, sender SMSSender, pepper string, maxDaily int) (
 	if store == nil || len(pepper) < 32 || maxDaily <= 0 {
 		return nil, errors.New("invalid phone auth configuration")
 	}
-	return &Service{store: store, sender: sender, pepper: []byte(pepper), maxDaily: maxDaily, now: func() time.Time { return time.Now().UTC() }}, nil
+	return &Service{store: store, sender: sender, pepper: []byte(pepper), maxDaily: maxDaily, now: func() time.Time { return time.Now().UTC() }, watchCodeGenerator: numericCode}, nil
 }
 
 func (s *Service) SetClockForTesting(now func() time.Time) { s.now = now }
-func ValidPhone(value string) bool                         { return phonePattern.MatchString(value) }
+func (s *Service) SetWatchCodeGeneratorForTesting(generator func() (string, error)) {
+	s.watchCodeGenerator = generator
+}
+func ValidPhone(value string) bool { return phonePattern.MatchString(value) }
 
 func (s *Service) Start(ctx context.Context, requestID, phone, sourceIP string) (StartResult, error) {
 	s.startMu.Lock()
@@ -160,66 +164,62 @@ func (s *Service) Verify(requestID, verificationID, code, deviceID, platform str
 		return SessionResult{}, bad("invalid request")
 	}
 	now := s.now()
-	state := s.store.Snapshot()
-	challenge, ok := state.Verifications[strings.ToLower(verificationID)]
-	if !ok || challenge.ConsumedAt != nil || !challenge.ProviderSubmitted {
-		return SessionResult{}, bad("invalid verification")
-	}
-	if !now.Before(challenge.ExpiresAt) {
-		return SessionResult{}, &ServiceError{Status: 410, Code: "verification expired"}
-	}
-	if challenge.Attempts >= 5 {
-		return SessionResult{}, tooMany("verification attempts exceeded", challenge.ExpiresAt)
-	}
-	expected := challenge.OTPHash
-	actual := s.hmac(challenge.VerificationID, challenge.PhoneE164, code)
-	valid := subtle.ConstantTimeCompare([]byte(expected), []byte(actual)) == 1
-	if !valid {
-		_ = s.store.Update(func(state *accounts.State) error {
-			v := state.Verifications[challenge.VerificationID]
-			v.Attempts++
-			state.Verifications[challenge.VerificationID] = v
-			return nil
-		})
-		return SessionResult{}, bad("invalid verification")
-	}
-	accountID := ""
-	for _, account := range state.Accounts {
-		if account.PhoneE164 == challenge.PhoneE164 && account.Status == "active" {
-			accountID = account.AccountID
-			break
-		}
-	}
-	if accountID == "" {
-		var err error
-		accountID, err = randomUUID()
-		if err != nil {
-			return SessionResult{}, err
-		}
-	}
-	issued, session, err := s.newSession(accountID, deviceID, platform, now)
+	issued, session, err := s.newSession("", deviceID, platform, now)
 	if err != nil {
 		return SessionResult{}, err
 	}
+	var resultErr error
+	var accountID, phone string
 	err = s.store.Update(func(state *accounts.State) error {
-		v, ok := state.Verifications[challenge.VerificationID]
-		if !ok || v.ConsumedAt != nil {
-			return conflict("verification consumed")
+		v, ok := state.Verifications[strings.ToLower(verificationID)]
+		if !ok || v.VerificationID != strings.ToLower(verificationID) || v.ConsumedAt != nil || !v.ProviderSubmitted {
+			resultErr = bad("invalid verification")
+			return nil
+		}
+		if !now.Before(v.ExpiresAt) {
+			resultErr = &ServiceError{Status: 410, Code: "verification expired"}
+			return nil
+		}
+		if v.Attempts >= 5 {
+			resultErr = tooMany("verification attempts exceeded", v.ExpiresAt)
+			return nil
+		}
+		actual := s.hmac(v.VerificationID, v.PhoneE164, code)
+		if subtle.ConstantTimeCompare([]byte(v.OTPHash), []byte(actual)) != 1 {
+			v.Attempts++
+			state.Verifications[v.VerificationID] = v
+			resultErr = bad("invalid verification")
+			return nil
+		}
+		phone = v.PhoneE164
+		for _, account := range state.Accounts {
+			if account.PhoneE164 == phone && account.Status == "active" {
+				accountID = account.AccountID
+				break
+			}
+		}
+		if accountID == "" {
+			accountID, err = randomUUID()
+			if err != nil {
+				return err
+			}
+			state.Accounts[accountID] = accounts.Account{AccountID: accountID, PhoneE164: phone, CreatedAt: now, Status: "active"}
 		}
 		v.ConsumedAt = &now
 		v.Attempts++
-		state.Verifications[challenge.VerificationID] = v
-		if _, ok := state.Accounts[accountID]; !ok {
-			state.Accounts[accountID] = accounts.Account{AccountID: accountID, PhoneE164: challenge.PhoneE164, CreatedAt: now, Status: "active"}
-		}
+		state.Verifications[v.VerificationID] = v
 		upsertDevice(state, accountID, deviceID, platform, now)
+		session.AccountID = accountID
 		state.Sessions[session.SessionID] = session
 		return nil
 	})
 	if err != nil {
 		return SessionResult{}, err
 	}
-	issued.Account = AccountView{AccountID: accountID, PhoneNumber: challenge.PhoneE164}
+	if resultErr != nil {
+		return SessionResult{}, resultErr
+	}
+	issued.Account = AccountView{AccountID: accountID, PhoneNumber: phone}
 	issued.DeviceID = deviceID
 	return issued, nil
 }
@@ -357,12 +357,30 @@ func (s *Service) WatchStart(requestID, deviceID, platform string) (WatchStartRe
 	if err != nil {
 		return WatchStartResult{}, err
 	}
-	code, err := numericCode()
-	if err != nil {
-		return WatchStartResult{}, err
-	}
-	link := accounts.WatchLink{LinkID: linkID, DeviceID: strings.ToLower(deviceID), Platform: platform, SecretHash: tokenHash(secret), CodeHash: s.hmac(linkID, strings.ToLower(deviceID), code), CreatedAt: now, ExpiresAt: now.Add(5 * time.Minute)}
+	var code string
+	link := accounts.WatchLink{LinkID: linkID, DeviceID: strings.ToLower(deviceID), Platform: platform, SecretHash: tokenHash(secret), CreatedAt: now, ExpiresAt: now.Add(5 * time.Minute)}
 	err = s.store.Update(func(state *accounts.State) error {
+		for attempt := 0; attempt < 20; attempt++ {
+			candidate, generateErr := s.watchCodeGenerator()
+			if generateErr != nil {
+				return generateErr
+			}
+			collision := false
+			for _, existing := range state.WatchLinks {
+				if existing.ClaimedAt == nil && now.Before(existing.ExpiresAt) && subtle.ConstantTimeCompare([]byte(existing.CodeHash), []byte(s.hmac(existing.LinkID, existing.DeviceID, candidate))) == 1 {
+					collision = true
+					break
+				}
+			}
+			if !collision {
+				code = candidate
+				break
+			}
+		}
+		if code == "" {
+			return &ServiceError{Status: 503, Code: "link code unavailable"}
+		}
+		link.CodeHash = s.hmac(link.LinkID, link.DeviceID, code)
 		state.WatchLinks[linkID] = link
 		state.WatchStartIdempotency[key] = accounts.WatchStartIdempotency{RequestID: key, DeviceID: strings.ToLower(deviceID), LinkID: linkID, CreatedAt: now}
 		prune(state, now)
@@ -379,22 +397,22 @@ func (s *Service) WatchClaim(identity Identity, requestID, code string) error {
 		return bad("invalid request")
 	}
 	now := s.now()
-	state := s.store.Snapshot()
-	matched := ""
-	for id, link := range state.WatchLinks {
-		if link.ClaimedAt == nil && now.Before(link.ExpiresAt) && subtle.ConstantTimeCompare([]byte(link.CodeHash), []byte(s.hmac(link.LinkID, link.DeviceID, code))) == 1 {
-			matched = id
-			break
-		}
-	}
-	if matched == "" {
-		return bad("invalid link code")
-	}
 	return s.store.Update(func(state *accounts.State) error {
-		link := state.WatchLinks[matched]
-		if link.ClaimedAt != nil || !now.Before(link.ExpiresAt) {
-			return conflict("link unavailable")
+		matched := ""
+		matches := 0
+		for id, link := range state.WatchLinks {
+			if link.ClaimedAt == nil && now.Before(link.ExpiresAt) && subtle.ConstantTimeCompare([]byte(link.CodeHash), []byte(s.hmac(link.LinkID, link.DeviceID, code))) == 1 {
+				matched = id
+				matches++
+			}
 		}
+		if matches == 0 {
+			return bad("invalid link code")
+		}
+		if matches > 1 {
+			return &ServiceError{Status: 503, Code: "ambiguous link code"}
+		}
+		link := state.WatchLinks[matched]
 		link.AccountID = identity.AccountID
 		link.ClaimedAt = &now
 		state.WatchLinks[matched] = link
