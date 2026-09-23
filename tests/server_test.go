@@ -530,6 +530,34 @@ func TestWatchBackgroundDiagnosticEventsAreExactAndBounded(t *testing.T) {
 	resp.Body.Close()
 }
 
+func TestOutgoingEndRaceDiagnosticEventsAreExactAndBounded(t *testing.T) {
+	srv, _, _ := fixture(t)
+	defer srv.Close()
+	events := []string{
+		"callkit_end_action_received",
+		"system_end_reconcile_started",
+		"system_end_reconcile_result",
+		"system_end_preserved_after_remote_accept",
+		"system_end_duplicate_preserved_during_connecting",
+	}
+	for _, event := range events {
+		body := map[string]any{
+			"requestID": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+			"role":      "B",
+			"platform":  "iOS",
+			"event":     event,
+			"status":    "success",
+			"callID":    "11111111-2222-4333-8444-555555555555",
+		}
+		resp := request(t, srv.URL, "POST", "/v1/devices/diagnostics", tokenB, body)
+		if resp.StatusCode != http.StatusNoContent {
+			resp.Body.Close()
+			t.Fatalf("event %s status %d", event, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+}
+
 func TestCallKitErrorDiagnosticIsAcceptedAndBounded(t *testing.T) {
 	srv, _, _ := fixture(t)
 	defer srv.Close()
