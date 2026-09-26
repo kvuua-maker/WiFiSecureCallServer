@@ -62,7 +62,10 @@ func main() {
 			slog.Error("phone authentication configuration failed", "error", e)
 			os.Exit(1)
 		}
-		auth.ConfigureAppleIdentity(appleauth.New("com.vkapps.wifisecurecall"))
+		auth.ConfigureAppleIdentity(appleauth.New(
+			"com.vkapps.wifisecurecall",
+			"com.vkapps.wifisecurecall.watchkitapp",
+		))
 		server = appserver.NewWithV2Calls(cfg.TokenA, cfg.TokenB, callStore, deviceStore, push, auth, accountcalls.New(cfg.RingTimeout))
 	}
 	httpServer := &http.Server{Addr: cfg.Address, Handler: server.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 8192}

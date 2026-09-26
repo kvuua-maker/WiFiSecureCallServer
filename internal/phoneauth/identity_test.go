@@ -36,6 +36,17 @@ func TestAppleSubjectStableUserAndZeroPhone(t *testing.T) {
 	if first.Account.PhoneNumber != "" || first.User == nil {
 		t.Fatal("Apple user incorrectly requires phone")
 	}
+	watch, err := svc.AppleSignIn(context.Background(), AppleSignInRequest{
+		RequestID: "44444444-4444-4444-8444-444444444444",
+		DeviceID:  "55555555-5555-4555-8555-555555555555",
+		Platform:  "watchOS", IdentityToken: "watch-token", Nonce: "watch-nonce",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.User.UserID != watch.User.UserID || first.Account.AccountID != watch.Account.AccountID {
+		t.Fatal("grouped Watch Apple sign-in created another identity")
+	}
 	fake.email = "changed@example.com"
 	second, err := svc.AppleSignIn(context.Background(), AppleSignInRequest{RequestID: "33333333-3333-4333-8333-333333333333", DeviceID: dev, Platform: "iOS", IdentityToken: "token2", Nonce: "nonce2"})
 	if err != nil {
@@ -49,6 +60,37 @@ func TestAppleSubjectStableUserAndZeroPhone(t *testing.T) {
 	}
 	if got, _ := svc.Profile(Identity{UserID: first.User.UserID}); got.PublicIdentity != "wsc:user:valid.name" {
 		t.Fatalf("bad public identity %q", got.PublicIdentity)
+	}
+}
+
+func TestAppleSignInAllowsOnlyIOSAndWatchOS(t *testing.T) {
+	for _, test := range []struct {
+		platform string
+		valid    bool
+	}{
+		{platform: "iOS", valid: true},
+		{platform: "watchOS", valid: true},
+		{platform: "macOS", valid: false},
+		{platform: "", valid: false},
+	} {
+		if got := validApplePlatform(test.platform); got != test.valid {
+			t.Fatalf("platform %q validity=%v, want %v", test.platform, got, test.valid)
+		}
+	}
+
+	store, err := accounts.Open(filepath.Join(t.TempDir(), "a.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc, _ := New(store, nil, "12345678901234567890123456789012", 5)
+	svc.ConfigureAppleIdentity(&fakeAppleVerifier{subject: "sub"})
+	_, err = svc.AppleSignIn(context.Background(), AppleSignInRequest{
+		RequestID: "11111111-1111-4111-8111-111111111111",
+		DeviceID:  "22222222-2222-4222-8222-222222222222",
+		Platform:  "arbitrary", IdentityToken: "token", Nonce: "nonce",
+	})
+	if errorStatus(err) != 400 {
+		t.Fatalf("arbitrary Apple platform status=%d", errorStatus(err))
 	}
 }
 

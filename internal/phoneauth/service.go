@@ -750,7 +750,7 @@ func (s *Service) AppleSignIn(ctx context.Context, request AppleSignInRequest) (
 	if s.appleVerifier == nil {
 		return SessionResult{}, &ServiceError{Status: 503, Code: "Apple authentication unavailable"}
 	}
-	if !validUUID(request.RequestID) || !validUUID(request.DeviceID) || request.Platform != "iOS" || request.IdentityToken == "" || request.Nonce == "" {
+	if !validUUID(request.RequestID) || !validUUID(request.DeviceID) || !validApplePlatform(request.Platform) || request.IdentityToken == "" || request.Nonce == "" {
 		return SessionResult{}, bad("invalid request")
 	}
 	claims, err := s.appleVerifier.Verify(ctx, request.IdentityToken, request.Nonce)
@@ -829,6 +829,10 @@ func (s *Service) AppleSignIn(ctx context.Context, request AppleSignInRequest) (
 	issued.DeviceID = strings.ToLower(request.DeviceID)
 	issued.User = s.userView(account.UserID)
 	return issued, nil
+}
+
+func validApplePlatform(platform string) bool {
+	return platform == "iOS" || platform == "watchOS"
 }
 
 func (s *Service) Profile(identity Identity) (UserView, error) {

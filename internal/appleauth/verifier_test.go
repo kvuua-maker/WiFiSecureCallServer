@@ -59,6 +59,26 @@ func TestVerifierSecurityContract(t *testing.T) {
 		t.Fatalf("valid native token rejected: claims=%+v error=%v", claims, err)
 	}
 
+	watchClaims := cloneClaims(baseClaims)
+	watchClaims["aud"] = "com.vkapps.wifisecurecall.watchkitapp"
+	assertVerifyFailure(t, verifier, signValid(watchClaims, key), rawNonce, FailureAudience)
+
+	groupedVerifier := New(
+		"com.vkapps.wifisecurecall",
+		"com.vkapps.wifisecurecall.watchkitapp",
+	)
+	groupedVerifier.KeysURL = server.URL
+	groupedVerifier.now = func() time.Time { return now }
+	if _, err := groupedVerifier.Verify(context.Background(), signValid(baseClaims, key), rawNonce); err != nil {
+		t.Fatalf("primary App ID audience rejected: %v", err)
+	}
+	if _, err := groupedVerifier.Verify(context.Background(), signValid(watchClaims, key), rawNonce); err != nil {
+		t.Fatalf("grouped Watch App ID audience rejected: %v", err)
+	}
+	arbitraryClaims := cloneClaims(baseClaims)
+	arbitraryClaims["aud"] = "com.vkapps.unrelated"
+	assertVerifyFailure(t, groupedVerifier, signValid(arbitraryClaims, key), rawNonce, FailureAudience)
+
 	for name, test := range map[string]struct {
 		mutate func(map[string]any)
 		code   FailureCode

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"math/big"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -46,17 +47,23 @@ type Verifier interface {
 }
 
 type RemoteVerifier struct {
-	Audience string
-	Client   *http.Client
-	KeysURL  string
-	now      func() time.Time
-	mu       sync.Mutex
-	keys     map[string]*rsa.PublicKey
-	keysAt   time.Time
+	Audiences []string
+	Client    *http.Client
+	KeysURL   string
+	now       func() time.Time
+	mu        sync.Mutex
+	keys      map[string]*rsa.PublicKey
+	keysAt    time.Time
 }
 
-func New(audience string) *RemoteVerifier {
-	return &RemoteVerifier{Audience: audience, Client: &http.Client{Timeout: 8 * time.Second}, KeysURL: issuer + "/auth/keys", now: time.Now}
+func New(audiences ...string) *RemoteVerifier {
+	allowed := make([]string, 0, len(audiences))
+	for _, audience := range audiences {
+		if audience != "" && !slices.Contains(allowed, audience) {
+			allowed = append(allowed, audience)
+		}
+	}
+	return &RemoteVerifier{Audiences: allowed, Client: &http.Client{Timeout: 8 * time.Second}, KeysURL: issuer + "/auth/keys", now: time.Now}
 }
 
 type tokenHeader struct {
@@ -116,7 +123,7 @@ func (v *RemoteVerifier) Verify(ctx context.Context, raw, nonce string) (Claims,
 	if c.Issuer != issuer {
 		return Claims{}, failure(FailureIssuer)
 	}
-	if !audienceIncludes(c.Audience, v.Audience) {
+	if !audienceIncludesAny(c.Audience, v.Audiences) {
 		return Claims{}, failure(FailureAudience)
 	}
 	if c.Expires <= v.now().Unix() {
@@ -140,6 +147,15 @@ func parseEmailVerified(value any) bool {
 	}
 	text, ok := value.(string)
 	return ok && strings.EqualFold(text, "true")
+}
+
+func audienceIncludesAny(value any, expected []string) bool {
+	for _, audience := range expected {
+		if audienceIncludes(value, audience) {
+			return true
+		}
+	}
+	return false
 }
 
 func audienceIncludes(value any, expected string) bool {
