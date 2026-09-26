@@ -2,6 +2,7 @@ package phoneauth
 
 import (
 	"context"
+	"errors"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/accounts"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/appleauth"
 	"path/filepath"
@@ -48,5 +49,23 @@ func TestAppleSubjectStableUserAndZeroPhone(t *testing.T) {
 	}
 	if got, _ := svc.Profile(Identity{UserID: first.User.UserID}); got.PublicIdentity != "wsc:user:valid.name" {
 		t.Fatalf("bad public identity %q", got.PublicIdentity)
+	}
+}
+
+func TestAppleVerificationFailureCodeIsSafelyPropagated(t *testing.T) {
+	store, err := accounts.Open(filepath.Join(t.TempDir(), "a.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc, _ := New(store, nil, "12345678901234567890123456789012", 5)
+	svc.ConfigureAppleIdentity(&fakeAppleVerifier{err: &appleauth.VerificationError{Code: appleauth.FailureNonce}})
+	_, err = svc.AppleSignIn(context.Background(), AppleSignInRequest{
+		RequestID: "11111111-1111-4111-8111-111111111111",
+		DeviceID:  "22222222-2222-4222-8222-222222222222",
+		Platform:  "iOS", IdentityToken: "token", Nonce: "nonce",
+	})
+	var serviceError *ServiceError
+	if !errors.As(err, &serviceError) || serviceError.Status != 401 || serviceError.Code != string(appleauth.FailureNonce) {
+		t.Fatalf("unexpected safe failure: %#v", err)
 	}
 }

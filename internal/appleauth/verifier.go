@@ -21,6 +21,26 @@ type Claims struct {
 	Subject, Email string
 	EmailVerified  bool
 }
+
+type FailureCode string
+
+const (
+	FailureJWTFormat FailureCode = "APPLE_VERIFY_JWT_FORMAT"
+	FailureHeader    FailureCode = "APPLE_VERIFY_HEADER"
+	FailureKeyFetch  FailureCode = "APPLE_VERIFY_KEY_FETCH"
+	FailureSignature FailureCode = "APPLE_VERIFY_SIGNATURE"
+	FailureIssuer    FailureCode = "APPLE_VERIFY_ISSUER"
+	FailureAudience  FailureCode = "APPLE_VERIFY_AUDIENCE"
+	FailureExpired   FailureCode = "APPLE_VERIFY_EXPIRED"
+	FailureNonce     FailureCode = "APPLE_VERIFY_NONCE"
+)
+
+type VerificationError struct{ Code FailureCode }
+
+func (e *VerificationError) Error() string { return string(e.Code) }
+
+func failure(code FailureCode) error { return &VerificationError{Code: code} }
+
 type Verifier interface {
 	Verify(context.Context, string, string) (Claims, error)
 }
@@ -66,41 +86,60 @@ type jwkSet struct {
 func (v *RemoteVerifier) Verify(ctx context.Context, raw, nonce string) (Claims, error) {
 	parts := strings.Split(raw, ".")
 	if len(parts) != 3 {
-		return Claims{}, errors.New("invalid Apple identity token")
+		return Claims{}, failure(FailureJWTFormat)
 	}
 	var header tokenHeader
 	hb, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil || json.Unmarshal(hb, &header) != nil || header.Algorithm != "RS256" || header.KeyID == "" {
-		return Claims{}, errors.New("invalid Apple identity token")
+		return Claims{}, failure(FailureHeader)
 	}
 	key, err := v.key(ctx, header.KeyID)
 	if err != nil {
-		return Claims{}, errors.New("Apple identity verification unavailable")
+		return Claims{}, failure(FailureKeyFetch)
 	}
 	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil {
-		return Claims{}, errors.New("invalid Apple identity token")
+		return Claims{}, failure(FailureSignature)
 	}
 	digest := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
 	if rsa.VerifyPKCS1v15(key, crypto.SHA256, digest[:], sig) != nil {
-		return Claims{}, errors.New("invalid Apple identity token")
+		return Claims{}, failure(FailureSignature)
 	}
 	pb, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return Claims{}, errors.New("invalid Apple identity token")
+		return Claims{}, failure(FailureJWTFormat)
 	}
 	var c tokenClaims
-	if json.Unmarshal(pb, &c) != nil || c.Issuer != issuer || c.Subject == "" || c.Expires <= v.now().Unix() || !audienceIncludes(c.Audience, v.Audience) {
-		return Claims{}, errors.New("invalid Apple identity token")
+	if json.Unmarshal(pb, &c) != nil || c.Subject == "" {
+		return Claims{}, failure(FailureJWTFormat)
+	}
+	if c.Issuer != issuer {
+		return Claims{}, failure(FailureIssuer)
+	}
+	if !audienceIncludes(c.Audience, v.Audience) {
+		return Claims{}, failure(FailureAudience)
+	}
+	if c.Expires <= v.now().Unix() {
+		return Claims{}, failure(FailureExpired)
 	}
 	if nonce != "" {
 		h := sha256.Sum256([]byte(nonce))
-		if !strings.EqualFold(c.Nonce, base64.RawURLEncoding.EncodeToString(h[:])) && !strings.EqualFold(c.Nonce, hexDigest(h[:])) {
-			return Claims{}, errors.New("invalid Apple identity token nonce")
+		// Native client contract: send SHA-256(rawNonce) as lowercase hex to
+		// ASAuthorizationAppleIDRequest, then send rawNonce to this verifier.
+		// The identity token must contain that exact single-hash value.
+		if c.Nonce != hexDigest(h[:]) {
+			return Claims{}, failure(FailureNonce)
 		}
 	}
-	verified := c.EmailVerified == true || c.EmailVerified == "true"
-	return Claims{Subject: c.Subject, Email: c.Email, EmailVerified: verified}, nil
+	return Claims{Subject: c.Subject, Email: c.Email, EmailVerified: parseEmailVerified(c.EmailVerified)}, nil
+}
+
+func parseEmailVerified(value any) bool {
+	if value == true {
+		return true
+	}
+	text, ok := value.(string)
+	return ok && strings.EqualFold(text, "true")
 }
 
 func audienceIncludes(value any, expected string) bool {

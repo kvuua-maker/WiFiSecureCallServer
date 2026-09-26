@@ -755,6 +755,14 @@ func (s *Service) AppleSignIn(ctx context.Context, request AppleSignInRequest) (
 	}
 	claims, err := s.appleVerifier.Verify(ctx, request.IdentityToken, request.Nonce)
 	if err != nil {
+		var verificationError *appleauth.VerificationError
+		if errors.As(err, &verificationError) {
+			status := 401
+			if verificationError.Code == appleauth.FailureKeyFetch {
+				status = 503
+			}
+			return SessionResult{}, &ServiceError{Status: status, Code: string(verificationError.Code)}
+		}
 		return SessionResult{}, unauthorized()
 	}
 	hash := appleSubjectHash(claims.Subject)
