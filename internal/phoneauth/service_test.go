@@ -26,6 +26,33 @@ type fakeSender struct {
 	messages []string
 }
 
+type fakeStatusSender struct {
+	*fakeSender
+	mu       sync.Mutex
+	statuses []string
+	checks   int
+}
+
+func (f *fakeStatusSender) Status(_ context.Context, messageID string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if messageID != "provider-id" || len(f.statuses) == 0 {
+		return "", errors.New("unexpected status request")
+	}
+	index := f.checks
+	if index >= len(f.statuses) {
+		index = len(f.statuses) - 1
+	}
+	f.checks++
+	return f.statuses[index], nil
+}
+
+func (f *fakeStatusSender) statusCheckCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.checks
+}
+
 func (f *fakeSender) Send(_ context.Context, _ string, message string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -129,6 +156,42 @@ func TestStartIdempotencyAndRateLimits(t *testing.T) {
 	if _, err := f.svc.Start(context.Background(), newUUID(t), "+442071838750", "192.0.2.2"); errorStatus(err) != 429 {
 		t.Fatalf("global cap: %v", err)
 	}
+}
+
+func TestDeliveryStatusTrackingPersistsSubmittedAndDeliveredStates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	store, err := accounts.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := &fakeStatusSender{fakeSender: &fakeSender{}, statuses: []string{"ENROUTE", "DELIVRD"}}
+	svc, err := New(store, sender, testPepper, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 26, 10, 0, 0, 0, time.UTC)
+	svc.SetClockForTesting(func() time.Time { return now })
+	svc.statusPollDelays = []time.Duration{0, 0}
+
+	started, err := svc.Start(context.Background(), newUUID(t), phoneOne, "192.0.2.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		verification := store.Snapshot().Verifications[started.VerificationID]
+		if verification.ProviderDeliveryStatus == "DELIVRD" {
+			if !verification.ProviderSubmitted || verification.ProviderMessageID != "provider-id" || verification.ProviderSubmittedAt == nil || verification.ProviderStatusCheckedAt == nil || verification.ProviderDeliveredAt == nil || verification.ProviderStatusError != "" {
+				t.Fatalf("incomplete delivery evidence: %#v", verification)
+			}
+			if sender.statusCheckCount() != 2 {
+				t.Fatalf("checks=%d", sender.statusCheckCount())
+			}
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("delivery status was not persisted")
 }
 
 func TestPhoneAndIPWindowLimits(t *testing.T) {

@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"regexp"
 	"strings"
@@ -24,6 +25,10 @@ var codePattern = regexp.MustCompile(`^[0-9]{6}$`)
 
 type SMSSender interface {
 	Send(context.Context, string, string) (string, error)
+}
+
+type SMSDeliveryStatusProvider interface {
+	Status(context.Context, string) (string, error)
 }
 
 type ServiceError struct {
@@ -48,6 +53,7 @@ type Service struct {
 	maxDaily           int
 	now                func() time.Time
 	watchCodeGenerator func() (string, error)
+	statusPollDelays   []time.Duration
 	startMu            sync.Mutex
 }
 
@@ -99,7 +105,11 @@ func New(store *accounts.Store, sender SMSSender, pepper string, maxDaily int) (
 	if store == nil || len(pepper) < 32 || maxDaily <= 0 {
 		return nil, errors.New("invalid phone auth configuration")
 	}
-	return &Service{store: store, sender: sender, pepper: []byte(pepper), maxDaily: maxDaily, now: func() time.Time { return time.Now().UTC() }, watchCodeGenerator: numericCode}, nil
+	return &Service{
+		store: store, sender: sender, pepper: []byte(pepper), maxDaily: maxDaily,
+		now: func() time.Time { return time.Now().UTC() }, watchCodeGenerator: numericCode,
+		statusPollDelays: []time.Duration{15 * time.Second, 45 * time.Second, 2 * time.Minute, 5 * time.Minute},
+	}, nil
 }
 
 func (s *Service) SetClockForTesting(now func() time.Time) { s.now = now }
@@ -158,18 +168,102 @@ func (s *Service) Start(ctx context.Context, requestID, phone, sourceIP string) 
 	})
 	messageID, sendErr := s.sender.Send(ctx, phone, fmt.Sprintf("WiFi Secure Call code: %s. Valid 10 min.", code))
 	if sendErr != nil {
+		_ = s.store.Update(func(state *accounts.State) error {
+			value := state.Verifications[verificationID]
+			value.ProviderStatusError = "submission_failed"
+			state.Verifications[verificationID] = value
+			return nil
+		})
 		return StartResult{}, &ServiceError{Status: 503, Code: "SMS submission failed"}
 	}
+	submittedAt := s.now()
 	if err := s.store.Update(func(state *accounts.State) error {
 		value := state.Verifications[verificationID]
 		value.ProviderSubmitted = true
 		value.ProviderMessageID = messageID
+		value.ProviderSubmittedAt = &submittedAt
+		value.ProviderStatusError = ""
 		state.Verifications[verificationID] = value
 		return nil
 	}); err != nil {
 		return StartResult{}, err
 	}
+	if provider, ok := s.sender.(SMSDeliveryStatusProvider); ok {
+		go s.trackDeliveryStatus(provider, verificationID, messageID)
+	}
 	return StartResult{VerificationID: verificationID, ExpiresAt: challenge.ExpiresAt, ResendAfter: challenge.ResendAfter}, nil
+}
+
+func (s *Service) trackDeliveryStatus(provider SMSDeliveryStatusProvider, verificationID, messageID string) {
+	delays := append([]time.Duration(nil), s.statusPollDelays...)
+	for _, delay := range delays {
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			<-timer.C
+		}
+		terminal, err := s.refreshDeliveryStatus(provider, verificationID, messageID)
+		if err != nil {
+			slog.Warn("SMS delivery status unavailable", "verification", maskedVerificationID(verificationID))
+			continue
+		}
+		if terminal {
+			return
+		}
+	}
+}
+
+func (s *Service) refreshDeliveryStatus(provider SMSDeliveryStatusProvider, verificationID, messageID string) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	status, err := provider.Status(ctx, messageID)
+	now := s.now()
+	if err != nil {
+		_ = s.store.Update(func(state *accounts.State) error {
+			value, ok := state.Verifications[verificationID]
+			if !ok || value.ProviderMessageID != messageID {
+				return nil
+			}
+			value.ProviderStatusAttemptedAt = &now
+			value.ProviderStatusError = "status_unavailable"
+			state.Verifications[verificationID] = value
+			return nil
+		})
+		return false, err
+	}
+	terminal := false
+	switch status {
+	case "ENROUTE":
+	case "DELIVRD", "EXPIRED", "UNDELIV", "REJECTD":
+		terminal = true
+	default:
+		return false, errors.New("invalid SMS delivery status")
+	}
+	if err := s.store.Update(func(state *accounts.State) error {
+		value, ok := state.Verifications[verificationID]
+		if !ok || value.ProviderMessageID != messageID {
+			return nil
+		}
+		value.ProviderStatusAttemptedAt = &now
+		value.ProviderStatusCheckedAt = &now
+		value.ProviderDeliveryStatus = status
+		value.ProviderStatusError = ""
+		if status == "DELIVRD" && value.ProviderDeliveredAt == nil {
+			value.ProviderDeliveredAt = &now
+		}
+		state.Verifications[verificationID] = value
+		return nil
+	}); err != nil {
+		return false, err
+	}
+	slog.Info("SMS delivery status updated", "verification", maskedVerificationID(verificationID), "status", status)
+	return terminal, nil
+}
+
+func maskedVerificationID(value string) string {
+	if len(value) < 8 {
+		return "***"
+	}
+	return value[:8] + "***"
 }
 
 func (s *Service) Verify(requestID, verificationID, code, deviceID, platform string) (SessionResult, error) {

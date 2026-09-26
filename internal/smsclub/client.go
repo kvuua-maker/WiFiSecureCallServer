@@ -24,6 +24,18 @@ type sendRequest struct {
 	Lifetime int      `json:"lifetime"`
 }
 
+type statusRequest struct {
+	MessageIDs []string `json:"id_sms"`
+}
+
+const (
+	StatusEnroute     = "ENROUTE"
+	StatusDelivered   = "DELIVRD"
+	StatusExpired     = "EXPIRED"
+	StatusUndelivered = "UNDELIV"
+	StatusRejected    = "REJECTD"
+)
+
 type Error struct {
 	Status    int
 	Retryable bool
@@ -74,39 +86,66 @@ func (c *Client) Send(ctx context.Context, phoneE164, message string) (string, e
 	if json.Unmarshal(data, &payload) != nil || len(payload.Success.Info) == 0 {
 		return "", errors.New("invalid SMSClub response")
 	}
-	id := firstScalar(payload.Success.Info)
+	id := messageID(payload.Success.Info, strings.TrimPrefix(phoneE164, "+"))
 	if id == "" {
 		return "", errors.New("SMSClub response missing message ID")
 	}
 	return id, nil
 }
 
-func firstScalar(raw json.RawMessage) string {
-	var value any
-	if json.Unmarshal(raw, &value) != nil {
+func (c *Client) Status(ctx context.Context, messageID string) (string, error) {
+	if strings.TrimSpace(messageID) == "" {
+		return "", errors.New("message ID is required")
+	}
+	body, err := json.Marshal(statusRequest{MessageIDs: []string{messageID}})
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/sms/status", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode/100 != 2 {
+		return "", &Error{Status: resp.StatusCode, Retryable: resp.StatusCode == 429 || resp.StatusCode >= 500, Message: fmt.Sprintf("SMSClub status %d", resp.StatusCode)}
+	}
+	var payload struct {
+		Success struct {
+			Info map[string]string `json:"info"`
+		} `json:"success_request"`
+	}
+	if json.Unmarshal(data, &payload) != nil {
+		return "", errors.New("invalid SMSClub response")
+	}
+	status := payload.Success.Info[messageID]
+	switch status {
+	case StatusEnroute, StatusDelivered, StatusExpired, StatusUndelivered, StatusRejected:
+		return status, nil
+	default:
+		return "", errors.New("SMSClub response missing delivery status")
+	}
+}
+
+func messageID(raw json.RawMessage, expectedPhone string) string {
+	var info map[string]json.RawMessage
+	if json.Unmarshal(raw, &info) != nil {
 		return ""
 	}
-	var walk func(any) string
-	walk = func(v any) string {
-		switch x := v.(type) {
-		case string:
-			return x
-		case float64:
-			return fmt.Sprintf("%.0f", x)
-		case []any:
-			for _, item := range x {
-				if s := walk(item); s != "" {
-					return s
-				}
-			}
-		case map[string]any:
-			for _, item := range x {
-				if s := walk(item); s != "" {
-					return s
-				}
-			}
+	for id, encodedPhone := range info {
+		var phone string
+		if json.Unmarshal(encodedPhone, &phone) == nil && phone == expectedPhone {
+			return id
 		}
-		return ""
 	}
-	return walk(value)
+	return ""
 }

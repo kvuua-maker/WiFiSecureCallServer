@@ -56,18 +56,24 @@ type Session struct {
 }
 
 type Verification struct {
-	VerificationID    string     `json:"verificationID"`
-	PhoneE164         string     `json:"phoneE164"`
-	SourceIP          string     `json:"sourceIP"`
-	OTPHash           string     `json:"otpHash"`
-	CreatedAt         time.Time  `json:"createdAt"`
-	ExpiresAt         time.Time  `json:"expiresAt"`
-	ResendAfter       time.Time  `json:"resendAfter"`
-	Attempts          int        `json:"attempts"`
-	ConsumedAt        *time.Time `json:"consumedAt,omitempty"`
-	ProviderAttempted bool       `json:"providerAttempted"`
-	ProviderSubmitted bool       `json:"providerSubmitted"`
-	ProviderMessageID string     `json:"providerMessageID,omitempty"`
+	VerificationID            string     `json:"verificationID"`
+	PhoneE164                 string     `json:"phoneE164"`
+	SourceIP                  string     `json:"sourceIP"`
+	OTPHash                   string     `json:"otpHash"`
+	CreatedAt                 time.Time  `json:"createdAt"`
+	ExpiresAt                 time.Time  `json:"expiresAt"`
+	ResendAfter               time.Time  `json:"resendAfter"`
+	Attempts                  int        `json:"attempts"`
+	ConsumedAt                *time.Time `json:"consumedAt,omitempty"`
+	ProviderAttempted         bool       `json:"providerAttempted"`
+	ProviderSubmitted         bool       `json:"providerSubmitted"`
+	ProviderMessageID         string     `json:"providerMessageID,omitempty"`
+	ProviderSubmittedAt       *time.Time `json:"providerSubmittedAt,omitempty"`
+	ProviderStatusAttemptedAt *time.Time `json:"providerStatusAttemptedAt,omitempty"`
+	ProviderStatusCheckedAt   *time.Time `json:"providerStatusCheckedAt,omitempty"`
+	ProviderDeliveredAt       *time.Time `json:"providerDeliveredAt,omitempty"`
+	ProviderDeliveryStatus    string     `json:"providerDeliveryStatus,omitempty"`
+	ProviderStatusError       string     `json:"providerStatusError,omitempty"`
 }
 
 type StartIdempotency struct {
