@@ -12,6 +12,7 @@ import (
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/accountcalls"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/accounts"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/apns"
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/appleauth"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/calls"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/config"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/devices"
@@ -61,6 +62,7 @@ func main() {
 			slog.Error("phone authentication configuration failed", "error", e)
 			os.Exit(1)
 		}
+		auth.ConfigureAppleIdentity(appleauth.New("com.vkapps.wifisecurecall"))
 		server = appserver.NewWithV2Calls(cfg.TokenA, cfg.TokenB, callStore, deviceStore, push, auth, accountcalls.New(cfg.RingTimeout))
 	}
 	httpServer := &http.Server{Addr: cfg.Address, Handler: server.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 8192}

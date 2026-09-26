@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/accounts"
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/appleauth"
 )
 
 var phonePattern = regexp.MustCompile(`^\+[1-9][0-9]{7,14}$`)
@@ -54,6 +55,7 @@ type Service struct {
 	now                func() time.Time
 	watchCodeGenerator func() (string, error)
 	statusPollDelays   []time.Duration
+	appleVerifier      appleauth.Verifier
 	startMu            sync.Mutex
 }
 
@@ -62,9 +64,19 @@ type StartResult struct {
 	ExpiresAt      time.Time `json:"expiresAt"`
 	ResendAfter    time.Time `json:"resendAfter"`
 }
+type UserView struct {
+	UserID         string   `json:"userID"`
+	Username       string   `json:"username"`
+	DisplayName    string   `json:"displayName,omitempty"`
+	Email          string   `json:"email,omitempty"`
+	VerifiedPhones []string `json:"verifiedPhones"`
+	PublicIdentity string   `json:"publicIdentity"`
+}
 type AccountView struct {
-	AccountID   string `json:"accountID"`
-	PhoneNumber string `json:"phoneNumber"`
+	AccountID    string `json:"accountID"`
+	UserID       string `json:"userID,omitempty"`
+	PhoneNumber  string `json:"phoneNumber,omitempty"`
+	DisplayLabel string `json:"displayLabel"`
 }
 type SessionResult struct {
 	Account          AccountView `json:"account"`
@@ -73,8 +85,9 @@ type SessionResult struct {
 	AccessExpiresAt  time.Time   `json:"accessExpiresAt"`
 	RefreshToken     string      `json:"refreshToken"`
 	RefreshExpiresAt time.Time   `json:"refreshExpiresAt"`
+	User             *UserView   `json:"user,omitempty"`
 }
-type Identity struct{ SessionID, AccountID, DeviceID, Platform, PhoneE164 string }
+type Identity struct{ SessionID, AccountID, UserID, DeviceID, Platform, PhoneE164 string }
 type WatchStartResult struct {
 	LinkID, LinkSecret, Code string
 	ExpiresAt                time.Time
@@ -83,6 +96,8 @@ type WatchStatusResult struct {
 	Status           string    `json:"status"`
 	AccountID        string    `json:"accountID,omitempty"`
 	PhoneNumber      string    `json:"phoneNumber,omitempty"`
+	DisplayLabel     string    `json:"displayLabel,omitempty"`
+	UserID           string    `json:"userID,omitempty"`
 	AccessToken      string    `json:"accessToken,omitempty"`
 	AccessExpiresAt  time.Time `json:"accessExpiresAt,omitempty"`
 	RefreshToken     string    `json:"refreshToken,omitempty"`
@@ -112,7 +127,8 @@ func New(store *accounts.Store, sender SMSSender, pepper string, maxDaily int) (
 	}, nil
 }
 
-func (s *Service) SetClockForTesting(now func() time.Time) { s.now = now }
+func (s *Service) SetClockForTesting(now func() time.Time)            { s.now = now }
+func (s *Service) ConfigureAppleIdentity(verifier appleauth.Verifier) { s.appleVerifier = verifier }
 func (s *Service) SetWatchCodeGeneratorForTesting(generator func() (string, error)) {
 	s.watchCodeGenerator = generator
 }
@@ -279,7 +295,7 @@ func (s *Service) Verify(requestID, verificationID, code, deviceID, platform str
 	var accountID, phone string
 	err = s.store.Update(func(state *accounts.State) error {
 		v, ok := state.Verifications[strings.ToLower(verificationID)]
-		if !ok || v.VerificationID != strings.ToLower(verificationID) || v.ConsumedAt != nil || !v.ProviderSubmitted {
+		if !ok || v.VerificationID != strings.ToLower(verificationID) || v.ConsumedAt != nil || !v.ProviderSubmitted || v.Purpose != "" {
 			resultErr = bad("invalid verification")
 			return nil
 		}
@@ -310,7 +326,10 @@ func (s *Service) Verify(requestID, verificationID, code, deviceID, platform str
 			if err != nil {
 				return err
 			}
-			state.Accounts[accountID] = accounts.Account{AccountID: accountID, PhoneE164: phone, CreatedAt: now, Status: "active"}
+			username := uniqueDefaultUsername(state, accountID)
+			state.Users[accountID] = accounts.User{UserID: accountID, Username: username, UsernameDisplay: username, CreatedAt: now, Status: "active"}
+			state.PhoneBindings[accountID] = accounts.PhoneBinding{BindingID: accountID, UserID: accountID, PhoneE164: phone, VerifiedAt: now, Status: "active"}
+			state.Accounts[accountID] = accounts.Account{AccountID: accountID, UserID: accountID, PhoneE164: phone, CreatedAt: now, Status: "active"}
 		}
 		v.ConsumedAt = &now
 		v.Attempts++
@@ -326,7 +345,9 @@ func (s *Service) Verify(requestID, verificationID, code, deviceID, platform str
 	if resultErr != nil {
 		return SessionResult{}, resultErr
 	}
-	issued.Account = AccountView{AccountID: accountID, PhoneNumber: phone}
+	account := s.store.Snapshot().Accounts[accountID]
+	issued.Account = s.accountView(account)
+	issued.User = s.userView(account.UserID)
 	issued.DeviceID = deviceID
 	return issued, nil
 }
@@ -344,7 +365,7 @@ func (s *Service) Authenticate(accessToken string) (Identity, error) {
 			if !ok {
 				break
 			}
-			return Identity{SessionID: session.SessionID, AccountID: session.AccountID, DeviceID: session.DeviceID, Platform: session.Platform, PhoneE164: account.PhoneE164}, nil
+			return Identity{SessionID: session.SessionID, AccountID: session.AccountID, UserID: account.UserID, DeviceID: session.DeviceID, Platform: session.Platform, PhoneE164: account.PhoneE164}, nil
 		}
 	}
 	return Identity{}, unauthorized()
@@ -387,7 +408,8 @@ func (s *Service) Refresh(refreshToken, deviceID string) (SessionResult, error) 
 		return SessionResult{}, err
 	}
 	account := state.Accounts[current.AccountID]
-	issued.Account = AccountView{AccountID: account.AccountID, PhoneNumber: account.PhoneE164}
+	issued.Account = s.accountView(account)
+	issued.User = s.userView(account.UserID)
 	issued.DeviceID = current.DeviceID
 	return issued, nil
 }
@@ -411,34 +433,60 @@ func (s *Service) DeleteAccount(identity Identity) error {
 		if !ok {
 			return unauthorized()
 		}
-		delete(state.Accounts, identity.AccountID)
+		userID := account.UserID
+		if userID == "" {
+			userID = account.AccountID
+		}
+		owned := map[string]bool{}
+		for id, candidate := range state.Accounts {
+			if candidate.UserID == userID || id == identity.AccountID {
+				owned[id] = true
+				delete(state.Accounts, id)
+			}
+		}
 		devices := state.Devices[:0]
 		for _, d := range state.Devices {
-			if d.AccountID != identity.AccountID {
+			if !owned[d.AccountID] {
 				devices = append(devices, d)
 			}
 		}
 		state.Devices = devices
 		for id, session := range state.Sessions {
-			if session.AccountID == identity.AccountID {
+			if owned[session.AccountID] {
 				delete(state.Sessions, id)
 			}
 		}
 		for id, link := range state.WatchLinks {
-			if link.AccountID == identity.AccountID {
+			if owned[link.AccountID] {
 				delete(state.WatchLinks, id)
 			}
 		}
 		for id, v := range state.Verifications {
-			if v.PhoneE164 == account.PhoneE164 {
+			if v.UserID == userID || (account.PhoneE164 != "" && v.PhoneE164 == account.PhoneE164) {
 				delete(state.Verifications, id)
 			}
 		}
 		for id, value := range state.StartIdempotency {
-			if value.PhoneE164 == account.PhoneE164 {
+			if account.PhoneE164 != "" && value.PhoneE164 == account.PhoneE164 {
 				delete(state.StartIdempotency, id)
 			}
 		}
+		for id, binding := range state.PhoneBindings {
+			if binding.UserID == userID {
+				delete(state.PhoneBindings, id)
+			}
+		}
+		for requestID, request := range state.AppleAuthRequests {
+			if request.UserID == userID {
+				delete(state.AppleAuthRequests, requestID)
+			}
+		}
+		for hash, mapping := range state.AppleIdentities {
+			if mapping.UserID == userID {
+				delete(state.AppleIdentities, hash)
+			}
+		}
+		delete(state.Users, userID)
 		return nil
 	})
 }
@@ -686,7 +734,278 @@ func (s *Service) WatchStatus(linkID, secret string) (WatchStatusResult, error) 
 		return WatchStatusResult{}, err
 	}
 	account := state.Accounts[link.AccountID]
-	return WatchStatusResult{Status: "claimed", AccountID: link.AccountID, PhoneNumber: maskPhone(account.PhoneE164), AccessToken: issued.AccessToken, AccessExpiresAt: issued.AccessExpiresAt, RefreshToken: issued.RefreshToken, RefreshExpiresAt: issued.RefreshExpiresAt}, nil
+	view := s.accountView(account)
+	phone := ""
+	if account.PhoneE164 != "" {
+		phone = maskPhone(account.PhoneE164)
+	}
+	return WatchStatusResult{Status: "claimed", AccountID: link.AccountID, UserID: account.UserID, PhoneNumber: phone, DisplayLabel: view.DisplayLabel, AccessToken: issued.AccessToken, AccessExpiresAt: issued.AccessExpiresAt, RefreshToken: issued.RefreshToken, RefreshExpiresAt: issued.RefreshExpiresAt}, nil
+}
+
+type AppleSignInRequest struct {
+	RequestID, DeviceID, Platform, IdentityToken, AuthorizationCode, Nonce, DisplayName, Email string
+}
+
+func (s *Service) AppleSignIn(ctx context.Context, request AppleSignInRequest) (SessionResult, error) {
+	if s.appleVerifier == nil {
+		return SessionResult{}, &ServiceError{Status: 503, Code: "Apple authentication unavailable"}
+	}
+	if !validUUID(request.RequestID) || !validUUID(request.DeviceID) || request.Platform != "iOS" || request.IdentityToken == "" || request.Nonce == "" {
+		return SessionResult{}, bad("invalid request")
+	}
+	claims, err := s.appleVerifier.Verify(ctx, request.IdentityToken, request.Nonce)
+	if err != nil {
+		return SessionResult{}, unauthorized()
+	}
+	hash := appleSubjectHash(claims.Subject)
+	now := s.now()
+	issued, session, err := s.newSession("", request.DeviceID, request.Platform, now)
+	if err != nil {
+		return SessionResult{}, err
+	}
+	var account accounts.Account
+	err = s.store.Update(func(state *accounts.State) error {
+		var userID string
+		requestKey := strings.ToLower(request.RequestID)
+		if prior, ok := state.AppleAuthRequests[requestKey]; ok && (prior.DeviceID != strings.ToLower(request.DeviceID) || prior.AppleSubjectHash != hash) {
+			return conflict("requestID conflict")
+		}
+		if existing, ok := state.AppleIdentities[hash]; ok {
+			userID = existing.UserID
+		}
+		if userID == "" {
+			userID, err = randomUUID()
+			if err != nil {
+				return err
+			}
+			username := uniqueDefaultUsername(state, userID)
+			email := ""
+			if claims.EmailVerified {
+				email = claims.Email
+			}
+			state.Users[userID] = accounts.User{UserID: userID, Username: username, UsernameDisplay: username, DisplayName: strings.TrimSpace(request.DisplayName), Email: email, CreatedAt: now, Status: "active"}
+			state.AppleIdentities[hash] = accounts.AppleIdentity{AppleSubjectHash: hash, UserID: userID, CreatedAt: now}
+		} else if user, ok := state.Users[userID]; ok {
+			if user.DisplayName == "" {
+				user.DisplayName = strings.TrimSpace(request.DisplayName)
+			}
+			if claims.EmailVerified && claims.Email != "" {
+				user.Email = claims.Email
+			}
+			state.Users[userID] = user
+		}
+		for _, candidate := range state.Accounts {
+			if candidate.UserID == userID && candidate.Status == "active" {
+				account = candidate
+				break
+			}
+		}
+		if account.AccountID == "" {
+			id, e := randomUUID()
+			if e != nil {
+				return e
+			}
+			account = accounts.Account{AccountID: id, UserID: userID, CreatedAt: now, Status: "active"}
+			state.Accounts[id] = account
+		}
+		upsertDevice(state, account.AccountID, request.DeviceID, request.Platform, now)
+		session.AccountID = account.AccountID
+		state.Sessions[session.SessionID] = session
+		state.AppleAuthRequests[requestKey] = accounts.AppleAuthRequest{RequestID: requestKey, DeviceID: strings.ToLower(request.DeviceID), AppleSubjectHash: hash, UserID: userID, AccountID: account.AccountID, CreatedAt: now}
+		return nil
+	})
+	if err != nil {
+		return SessionResult{}, err
+	}
+	issued.Account = s.accountView(account)
+	issued.DeviceID = strings.ToLower(request.DeviceID)
+	issued.User = s.userView(account.UserID)
+	return issued, nil
+}
+
+func (s *Service) Profile(identity Identity) (UserView, error) {
+	if identity.UserID == "" {
+		return UserView{}, unauthorized()
+	}
+	view := s.userView(identity.UserID)
+	if view == nil {
+		return UserView{}, unauthorized()
+	}
+	return *view, nil
+}
+
+var usernamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{2,29}$`)
+var reservedUsernames = map[string]bool{"admin": true, "support": true, "system": true, "wifisecurecall": true, "apple": true}
+
+func (s *Service) SetUsername(identity Identity, value string) (UserView, error) {
+	key := strings.ToLower(strings.TrimSpace(value))
+	if !usernamePattern.MatchString(key) || reservedUsernames[key] {
+		return UserView{}, bad("invalid username")
+	}
+	err := s.store.Update(func(state *accounts.State) error {
+		for id, u := range state.Users {
+			if id != identity.UserID && strings.EqualFold(u.Username, key) {
+				return conflict("username unavailable")
+			}
+		}
+		u, ok := state.Users[identity.UserID]
+		if !ok {
+			return unauthorized()
+		}
+		u.Username = key
+		u.UsernameDisplay = strings.TrimSpace(value)
+		state.Users[identity.UserID] = u
+		return nil
+	})
+	if err != nil {
+		return UserView{}, err
+	}
+	return *s.userView(identity.UserID), nil
+}
+
+func (s *Service) StartPhoneBinding(ctx context.Context, identity Identity, requestID, phone, sourceIP string) (StartResult, error) {
+	if identity.UserID == "" {
+		return StartResult{}, unauthorized()
+	}
+	if prior, ok := s.store.Snapshot().StartIdempotency[strings.ToLower(requestID)]; ok && (prior.UserID != identity.UserID || prior.Purpose != "phone_binding") {
+		return StartResult{}, conflict("requestID conflict")
+	}
+	result, err := s.Start(ctx, requestID, phone, sourceIP)
+	if err != nil {
+		return result, err
+	}
+	err = s.store.Update(func(state *accounts.State) error {
+		v := state.Verifications[result.VerificationID]
+		v.UserID = identity.UserID
+		v.Purpose = "phone_binding"
+		state.Verifications[v.VerificationID] = v
+		idem := state.StartIdempotency[strings.ToLower(requestID)]
+		idem.UserID = identity.UserID
+		idem.Purpose = "phone_binding"
+		state.StartIdempotency[strings.ToLower(requestID)] = idem
+		return nil
+	})
+	return result, err
+}
+
+func (s *Service) VerifyPhoneBinding(identity Identity, verificationID, code string) (UserView, error) {
+	if identity.UserID == "" || !validUUID(verificationID) || !codePattern.MatchString(code) {
+		return UserView{}, bad("invalid request")
+	}
+	now := s.now()
+	var resultErr error
+	err := s.store.Update(func(state *accounts.State) error {
+		v, ok := state.Verifications[strings.ToLower(verificationID)]
+		if !ok || v.UserID != identity.UserID || v.Purpose != "phone_binding" || v.ConsumedAt != nil || !v.ProviderSubmitted {
+			resultErr = bad("invalid verification")
+			return nil
+		}
+		if !now.Before(v.ExpiresAt) {
+			resultErr = &ServiceError{Status: 410, Code: "verification expired"}
+			return nil
+		}
+		if v.Attempts >= 5 {
+			resultErr = tooMany("verification attempts exceeded", v.ExpiresAt)
+			return nil
+		}
+		actual := s.hmac(v.VerificationID, v.PhoneE164, code)
+		if subtle.ConstantTimeCompare([]byte(v.OTPHash), []byte(actual)) != 1 {
+			v.Attempts++
+			state.Verifications[v.VerificationID] = v
+			resultErr = bad("invalid verification")
+			return nil
+		}
+		for _, b := range state.PhoneBindings {
+			if b.Status == "active" && b.PhoneE164 == v.PhoneE164 && b.UserID != identity.UserID {
+				resultErr = conflict("phone already bound")
+				return nil
+			}
+		}
+		id, e := randomUUID()
+		if e != nil {
+			return e
+		}
+		state.PhoneBindings[id] = accounts.PhoneBinding{BindingID: id, UserID: identity.UserID, PhoneE164: v.PhoneE164, VerifiedAt: now, Status: "active"}
+		v.ConsumedAt = &now
+		v.Attempts++
+		state.Verifications[v.VerificationID] = v
+		return nil
+	})
+	if err != nil {
+		return UserView{}, err
+	}
+	if resultErr != nil {
+		return UserView{}, resultErr
+	}
+	return *s.userView(identity.UserID), nil
+}
+
+func (s *Service) RemovePhoneBinding(identity Identity, bindingID string) error {
+	if identity.UserID == "" || !validUUID(bindingID) {
+		return bad("invalid request")
+	}
+	return s.store.Update(func(state *accounts.State) error {
+		b, ok := state.PhoneBindings[strings.ToLower(bindingID)]
+		if !ok || b.UserID != identity.UserID {
+			return forbidden("phone binding unavailable")
+		}
+		delete(state.PhoneBindings, strings.ToLower(bindingID))
+		for id, account := range state.Accounts {
+			if account.UserID == identity.UserID && account.PhoneE164 == b.PhoneE164 {
+				account.PhoneE164 = ""
+				state.Accounts[id] = account
+			}
+		}
+		return nil
+	})
+}
+
+func (s *Service) accountView(account accounts.Account) AccountView {
+	label := maskPhone(account.PhoneE164)
+	if account.PhoneE164 == "" {
+		if u := s.userView(account.UserID); u != nil {
+			label = "@" + u.Username
+		}
+	}
+	if label == "" {
+		label = "Secure account"
+	}
+	return AccountView{AccountID: account.AccountID, UserID: account.UserID, PhoneNumber: account.PhoneE164, DisplayLabel: label}
+}
+func (s *Service) userView(userID string) *UserView {
+	state := s.store.Snapshot()
+	u, ok := state.Users[userID]
+	if !ok {
+		return nil
+	}
+	phones := []string{}
+	for _, b := range state.PhoneBindings {
+		if b.UserID == userID && b.Status == "active" {
+			phones = append(phones, maskPhone(b.PhoneE164))
+		}
+	}
+	return &UserView{UserID: u.UserID, Username: u.Username, DisplayName: u.DisplayName, Email: u.Email, VerifiedPhones: phones, PublicIdentity: "wsc:user:" + u.Username}
+}
+func uniqueDefaultUsername(state *accounts.State, userID string) string {
+	base := "user-" + strings.ReplaceAll(userID, "-", "")[:12]
+	candidate := base
+	for n := 2; ; n++ {
+		used := false
+		for _, u := range state.Users {
+			if strings.EqualFold(u.Username, candidate) {
+				used = true
+				break
+			}
+		}
+		if !used {
+			return candidate
+		}
+		candidate = fmt.Sprintf("%s-%d", base, n)
+	}
+}
+func appleSubjectHash(subject string) string {
+	sum := sha256.Sum256([]byte("apple\x00" + subject))
+	return hex.EncodeToString(sum[:])
 }
 
 func (s *Service) newSession(accountID, deviceID, platform string, now time.Time) (SessionResult, accounts.Session, error) {
@@ -723,6 +1042,11 @@ func prune(state *accounts.State, now time.Time) {
 	for id, value := range state.StartIdempotency {
 		if now.Sub(value.CreatedAt) > 24*time.Hour {
 			delete(state.StartIdempotency, id)
+		}
+	}
+	for id, value := range state.AppleAuthRequests {
+		if now.Sub(value.CreatedAt) > 24*time.Hour {
+			delete(state.AppleAuthRequests, id)
 		}
 	}
 	for id, value := range state.WatchStartIdempotency {

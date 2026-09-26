@@ -7,17 +7,51 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 )
 
-const SchemaVersion = 1
+const SchemaVersion = 2
 
 type Account struct {
 	AccountID string    `json:"accountID"`
+	UserID    string    `json:"userID,omitempty"`
 	PhoneE164 string    `json:"phoneE164"`
 	CreatedAt time.Time `json:"createdAt"`
 	Status    string    `json:"status"`
+}
+
+type User struct {
+	UserID          string    `json:"userID"`
+	Username        string    `json:"username"`
+	UsernameDisplay string    `json:"usernameDisplay"`
+	DisplayName     string    `json:"displayName,omitempty"`
+	Email           string    `json:"email,omitempty"`
+	CreatedAt       time.Time `json:"createdAt"`
+	Status          string    `json:"status"`
+}
+
+type PhoneBinding struct {
+	BindingID  string    `json:"bindingID"`
+	UserID     string    `json:"userID"`
+	PhoneE164  string    `json:"phoneE164"`
+	VerifiedAt time.Time `json:"verifiedAt"`
+	Status     string    `json:"status"`
+}
+
+type AppleIdentity struct {
+	AppleSubjectHash string    `json:"appleSubjectHash"`
+	UserID           string    `json:"userID"`
+	CreatedAt        time.Time `json:"createdAt"`
+}
+type AppleAuthRequest struct {
+	RequestID        string    `json:"requestID"`
+	DeviceID         string    `json:"deviceID"`
+	AppleSubjectHash string    `json:"appleSubjectHash"`
+	UserID           string    `json:"userID"`
+	AccountID        string    `json:"accountID"`
+	CreatedAt        time.Time `json:"createdAt"`
 }
 
 type Device struct {
@@ -74,10 +108,14 @@ type Verification struct {
 	ProviderDeliveredAt       *time.Time `json:"providerDeliveredAt,omitempty"`
 	ProviderDeliveryStatus    string     `json:"providerDeliveryStatus,omitempty"`
 	ProviderStatusError       string     `json:"providerStatusError,omitempty"`
+	UserID                    string     `json:"userID,omitempty"`
+	Purpose                   string     `json:"purpose,omitempty"`
 }
 
 type StartIdempotency struct {
 	RequestID      string    `json:"requestID"`
+	UserID         string    `json:"userID,omitempty"`
+	Purpose        string    `json:"purpose,omitempty"`
 	PhoneE164      string    `json:"phoneE164"`
 	VerificationID string    `json:"verificationID"`
 	CreatedAt      time.Time `json:"createdAt"`
@@ -112,6 +150,10 @@ type State struct {
 	StartIdempotency      map[string]StartIdempotency      `json:"startIdempotency"`
 	WatchStartIdempotency map[string]WatchStartIdempotency `json:"watchStartIdempotency"`
 	WatchLinks            map[string]WatchLink             `json:"watchLinks"`
+	Users                 map[string]User                  `json:"users"`
+	PhoneBindings         map[string]PhoneBinding          `json:"phoneBindings"`
+	AppleIdentities       map[string]AppleIdentity         `json:"appleIdentities"`
+	AppleAuthRequests     map[string]AppleAuthRequest      `json:"appleAuthRequests"`
 }
 
 type Store struct {
@@ -121,7 +163,7 @@ type Store struct {
 }
 
 func emptyState() State {
-	return State{SchemaVersion: SchemaVersion, Accounts: map[string]Account{}, Sessions: map[string]Session{}, Verifications: map[string]Verification{}, StartIdempotency: map[string]StartIdempotency{}, WatchStartIdempotency: map[string]WatchStartIdempotency{}, WatchLinks: map[string]WatchLink{}}
+	return State{SchemaVersion: SchemaVersion, Accounts: map[string]Account{}, Sessions: map[string]Session{}, Verifications: map[string]Verification{}, StartIdempotency: map[string]StartIdempotency{}, WatchStartIdempotency: map[string]WatchStartIdempotency{}, WatchLinks: map[string]WatchLink{}, Users: map[string]User{}, PhoneBindings: map[string]PhoneBinding{}, AppleIdentities: map[string]AppleIdentity{}, AppleAuthRequests: map[string]AppleAuthRequest{}}
 }
 
 func Open(path string) (*Store, error) {
@@ -137,26 +179,99 @@ func Open(path string) (*Store, error) {
 	if err := json.Unmarshal(data, &state); err != nil {
 		return nil, errors.New("invalid account state")
 	}
+	migrated := false
+	if state.SchemaVersion == 1 {
+		migrateV1(&state)
+		migrated = true
+	}
 	if err := validateState(state); err != nil {
 		return nil, err
 	}
 	s.state = state
+	if migrated {
+		if err := s.persist(state); err != nil {
+			return nil, err
+		}
+	}
 	return s, nil
 }
 
+func migrateV1(state *State) {
+	state.SchemaVersion = SchemaVersion
+	state.Users = map[string]User{}
+	state.PhoneBindings = map[string]PhoneBinding{}
+	state.AppleIdentities = map[string]AppleIdentity{}
+	state.AppleAuthRequests = map[string]AppleAuthRequest{}
+	for id, account := range state.Accounts {
+		account.UserID = id
+		state.Accounts[id] = account
+		compact := strings.ReplaceAll(id, "-", "")
+		suffix := compact
+		if len(suffix) > 12 {
+			suffix = suffix[:12]
+		}
+		username := "legacy-" + suffix
+		state.Users[id] = User{UserID: id, Username: username, UsernameDisplay: username, CreatedAt: account.CreatedAt, Status: "active"}
+		if account.PhoneE164 != "" {
+			state.PhoneBindings[id] = PhoneBinding{BindingID: id, UserID: id, PhoneE164: account.PhoneE164, VerifiedAt: account.CreatedAt, Status: "active"}
+		}
+	}
+}
+
 func validateState(s State) error {
-	if s.SchemaVersion != SchemaVersion || s.Accounts == nil || s.Sessions == nil || s.Verifications == nil || s.StartIdempotency == nil || s.WatchStartIdempotency == nil || s.WatchLinks == nil {
+	if s.SchemaVersion != SchemaVersion || s.Accounts == nil || s.Sessions == nil || s.Verifications == nil || s.StartIdempotency == nil || s.WatchStartIdempotency == nil || s.WatchLinks == nil || s.Users == nil || s.PhoneBindings == nil || s.AppleIdentities == nil || s.AppleAuthRequests == nil {
 		return errors.New("unsupported account state schema")
 	}
 	phones := make(map[string]string, len(s.Accounts))
 	for id, account := range s.Accounts {
-		if id == "" || account.AccountID != id || account.PhoneE164 == "" || account.Status != "active" {
+		if id == "" || account.AccountID != id || account.Status != "active" {
 			return errors.New("invalid account state")
 		}
-		if previous, exists := phones[account.PhoneE164]; exists && previous != id {
-			return errors.New("duplicate active account phone")
+		if account.PhoneE164 != "" {
+			if previous, exists := phones[account.PhoneE164]; exists && previous != id {
+				return errors.New("duplicate active account phone")
+			}
+			phones[account.PhoneE164] = id
 		}
-		phones[account.PhoneE164] = id
+	}
+	usernames := map[string]string{}
+	for id, user := range s.Users {
+		key := strings.ToLower(user.Username)
+		if id == "" || user.UserID != id || !validUUID(id) || key == "" || user.Status != "active" {
+			return errors.New("invalid user state")
+		}
+		if prior, ok := usernames[key]; ok && prior != id {
+			return errors.New("duplicate username")
+		}
+		usernames[key] = id
+	}
+	for _, account := range s.Accounts {
+		if account.UserID != "" {
+			if _, ok := s.Users[account.UserID]; !ok {
+				return errors.New("invalid account user")
+			}
+		}
+	}
+	bound := map[string]string{}
+	for id, binding := range s.PhoneBindings {
+		if id == "" || binding.BindingID != id || binding.Status != "active" || binding.PhoneE164 == "" {
+			return errors.New("invalid phone binding state")
+		}
+		if _, ok := s.Users[binding.UserID]; !ok {
+			return errors.New("invalid phone binding user")
+		}
+		if prior, ok := bound[binding.PhoneE164]; ok && prior != id {
+			return errors.New("duplicate phone binding")
+		}
+		bound[binding.PhoneE164] = id
+	}
+	for hash, identity := range s.AppleIdentities {
+		if hash == "" || identity.AppleSubjectHash != hash {
+			return errors.New("invalid apple identity state")
+		}
+		if _, ok := s.Users[identity.UserID]; !ok {
+			return errors.New("invalid apple identity user")
+		}
 	}
 	devices := make(map[string]struct{}, len(s.Devices))
 	for _, device := range s.Devices {

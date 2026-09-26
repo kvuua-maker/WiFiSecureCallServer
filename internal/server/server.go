@@ -60,6 +60,7 @@ func NewWithV2Calls(tokenA, tokenB string, callStore *calls.Store, deviceStore *
 	s.mux.HandleFunc("POST /v1/calls/{id}/{action}", s.auth(s.mutate))
 	s.mux.HandleFunc("/media", s.serveMedia)
 	s.registerV2()
+	s.registerV3()
 	return s
 }
 func (s *Server) Handler() http.Handler { return securityHeaders(s.mux) }
