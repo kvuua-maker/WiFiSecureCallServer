@@ -16,6 +16,10 @@ func (s *Server) registerV3() {
 	s.mux.HandleFunc("POST /v3/phones/verify", s.v2Auth(s.phoneBindingVerify))
 	s.mux.HandleFunc("DELETE /v3/phones/{id}", s.v2Auth(s.phoneBindingDelete))
 	s.mux.HandleFunc("DELETE /v3/account", s.v2Auth(s.deleteAccount))
+	s.mux.HandleFunc("POST /v3/recipients/resolve", s.v2Auth(s.resolveRecipient))
+	s.mux.HandleFunc("POST /v3/calls", s.v2Auth(s.createUserCall))
+	s.mux.HandleFunc("GET /v3/calls/{id}", s.v2Auth(s.getUserCall))
+	s.mux.HandleFunc("POST /v3/calls/{id}/{action}", s.v2Auth(s.mutateUserCall))
 }
 
 type appleSignInRequest struct{ RequestID, DeviceID, Platform, IdentityToken, AuthorizationCode, Nonce, DisplayName, Email string }

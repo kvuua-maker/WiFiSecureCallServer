@@ -153,3 +153,32 @@ func TestAccountIncomingCallTopicsAndPayload(t *testing.T) {
 		})
 	}
 }
+
+func TestUserIncomingCallCarriesSafeCallerIdentityAndOneLogicalCallID(t *testing.T) {
+	tests := []struct {
+		platform, pushType, topic string
+	}{
+		{"iOS", "voip", "com.vkapps.wifisecurecall.voip"},
+		{"watchOS", "alert", "com.vkapps.wifisecurecall.watchkitapp"},
+	}
+	for _, test := range tests {
+		var captured capturedAPNSRequest
+		client := testClient(t, &captured)
+		callID := "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+		accountID := "11111111-2222-4333-8444-555555555555"
+		if _, err := client.IncomingUserCall(context.Background(), test.platform, "0123456789abcdef", callID, test.pushType, time.Now().Add(30*time.Second), accountID, "alice", "Alice"); err != nil {
+			t.Fatal(err)
+		}
+		if captured.header.Get("apns-topic") != test.topic || captured.payload["event"] != "incoming_call_v3" {
+			t.Fatalf("headers=%v payload=%#v", captured.header, captured.payload)
+		}
+		if captured.payload["serverCallID"] != callID || captured.payload["accountID"] != accountID || captured.payload["callerUsername"] != "alice" || captured.payload["callerPublicIdentity"] != "wsc:user:alice" || captured.payload["callerDisplayName"] != "Alice" {
+			t.Fatalf("payload=%#v", captured.payload)
+		}
+		for _, forbidden := range []string{"email", "appleSubject", "mediaToken", "accessToken", "refreshToken"} {
+			if _, exists := captured.payload[forbidden]; exists {
+				t.Fatalf("payload exposed %s", forbidden)
+			}
+		}
+	}
+}

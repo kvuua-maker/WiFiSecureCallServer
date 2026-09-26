@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/accountcalls"
@@ -19,9 +20,11 @@ import (
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/devices"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/media"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/phoneauth"
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/usercalls"
 )
 
 type Server struct {
+	callCreationMu sync.Mutex
 	tokenA, tokenB string
 	calls          *calls.Store
 	devices        *devices.Store
@@ -30,6 +33,7 @@ type Server struct {
 	mux            *http.ServeMux
 	phoneAuth      *phoneauth.Service
 	accountCalls   *accountcalls.Store
+	userCalls      *usercalls.Store
 	accountMedia   *accountmedia.Hub
 }
 
@@ -46,10 +50,18 @@ func NewWithV2(tokenA, tokenB string, callStore *calls.Store, deviceStore *devic
 }
 
 func NewWithV2Calls(tokenA, tokenB string, callStore *calls.Store, deviceStore *devices.Store, push apns.Sender, auth *phoneauth.Service, accountCallStore *accountcalls.Store) *Server {
-	s := &Server{tokenA: tokenA, tokenB: tokenB, calls: callStore, devices: deviceStore, apns: push, phoneAuth: auth, accountCalls: accountCallStore}
+	var userCallStore *usercalls.Store
+	if auth != nil {
+		userCallStore = usercalls.New(30 * time.Second)
+	}
+	return NewWithCallStores(tokenA, tokenB, callStore, deviceStore, push, auth, accountCallStore, userCallStore)
+}
+
+func NewWithCallStores(tokenA, tokenB string, callStore *calls.Store, deviceStore *devices.Store, push apns.Sender, auth *phoneauth.Service, accountCallStore *accountcalls.Store, userCallStore *usercalls.Store) *Server {
+	s := &Server{tokenA: tokenA, tokenB: tokenB, calls: callStore, devices: deviceStore, apns: push, phoneAuth: auth, accountCalls: accountCallStore, userCalls: userCallStore}
 	s.media = media.New(callStore)
-	if accountCallStore != nil {
-		s.accountMedia = accountmedia.New(accountCallStore)
+	if accountCallStore != nil || userCallStore != nil {
+		s.accountMedia = accountmedia.New(combinedCallValidator{account: accountCallStore, user: userCallStore})
 	}
 	s.mux = http.NewServeMux()
 	s.mux.HandleFunc("GET /v1/health", s.health)

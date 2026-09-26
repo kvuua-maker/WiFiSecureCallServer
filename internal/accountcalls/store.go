@@ -253,6 +253,30 @@ func (s *Store) MediaPeerLeft(callID, side, epoch string) {
 	}
 }
 
+func (s *Store) HasCall(callID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.gcLocked()
+	_, ok := s.calls[normalize(callID)]
+	return ok
+}
+
+func (s *Store) DeviceBusy(deviceID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.gcLocked()
+	deviceID = normalize(deviceID)
+	for _, call := range s.calls {
+		if call.State != Ringing && call.State != Accepted {
+			continue
+		}
+		if call.CallerDeviceID == deviceID || call.CalleeDeviceID == deviceID {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Store) IsAccepted(callID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

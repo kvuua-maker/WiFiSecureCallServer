@@ -89,7 +89,14 @@ func (s *Server) v2CreateCall(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "target device not call-ready")
 		return
 	}
+	s.callCreationMu.Lock()
+	if s.userCalls != nil && (s.userCalls.HasCall(body.CallID) || s.userCalls.DeviceBusy(identity.DeviceID) || s.userCalls.DeviceBusy(target.DeviceID)) {
+		s.callCreationMu.Unlock()
+		writeError(w, http.StatusConflict, "device already has an active call")
+		return
+	}
 	view, createdNew, err := s.accountCalls.Create(body.CallID, body.RequestID, identity.AccountID, identity.DeviceID, target.DeviceID)
+	s.callCreationMu.Unlock()
 	if err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return

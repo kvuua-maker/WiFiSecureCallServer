@@ -27,6 +27,9 @@ type Sender interface {
 type AccountSender interface {
 	IncomingAccountCall(context.Context, string, string, string, string, time.Time, string) (Result, error)
 }
+type UserCallSender interface {
+	IncomingUserCall(context.Context, string, string, string, string, time.Time, string, string, string) (Result, error)
+}
 type Result struct {
 	Status                            int
 	Reason, APNSID                    string
@@ -39,6 +42,9 @@ func (Disabled) IncomingCall(context.Context, string, string, string, string, ti
 	return Result{}, errors.New("APNs disabled")
 }
 func (Disabled) IncomingAccountCall(context.Context, string, string, string, string, time.Time, string) (Result, error) {
+	return Result{}, errors.New("APNs disabled")
+}
+func (Disabled) IncomingUserCall(context.Context, string, string, string, string, time.Time, string, string, string) (Result, error) {
 	return Result{}, errors.New("APNs disabled")
 }
 func (Disabled) Configured() bool { return false }
@@ -93,18 +99,30 @@ func (c *Client) IncomingCall(ctx context.Context, role, deviceToken, callID, pu
 }
 
 func (c *Client) IncomingAccountCall(ctx context.Context, platform, deviceToken, callID, pushType string, ringExpiresAt time.Time, accountID string) (Result, error) {
-	result, err := c.incomingAccountCall(ctx, platform, deviceToken, callID, pushType, ringExpiresAt, accountID)
+	result, err := c.incomingAccountCall(ctx, platform, deviceToken, callID, pushType, ringExpiresAt, accountID, "incoming_call_v2", "", "")
 	if result.Reason == "ExpiredProviderToken" {
 		c.mu.Lock()
 		c.jwt = ""
 		c.jwtAt = time.Time{}
 		c.mu.Unlock()
-		return c.incomingAccountCall(ctx, platform, deviceToken, callID, pushType, ringExpiresAt, accountID)
+		return c.incomingAccountCall(ctx, platform, deviceToken, callID, pushType, ringExpiresAt, accountID, "incoming_call_v2", "", "")
 	}
 	return result, err
 }
 
-func (c *Client) incomingAccountCall(ctx context.Context, platform, deviceToken, callID, pushType string, ringExpiresAt time.Time, accountID string) (Result, error) {
+func (c *Client) IncomingUserCall(ctx context.Context, platform, deviceToken, callID, pushType string, ringExpiresAt time.Time, accountID, callerUsername, callerDisplayName string) (Result, error) {
+	result, err := c.incomingAccountCall(ctx, platform, deviceToken, callID, pushType, ringExpiresAt, accountID, "incoming_call_v3", callerUsername, callerDisplayName)
+	if result.Reason == "ExpiredProviderToken" {
+		c.mu.Lock()
+		c.jwt = ""
+		c.jwtAt = time.Time{}
+		c.mu.Unlock()
+		return c.incomingAccountCall(ctx, platform, deviceToken, callID, pushType, ringExpiresAt, accountID, "incoming_call_v3", callerUsername, callerDisplayName)
+	}
+	return result, err
+}
+
+func (c *Client) incomingAccountCall(ctx context.Context, platform, deviceToken, callID, pushType string, ringExpiresAt time.Time, accountID, event, callerUsername, callerDisplayName string) (Result, error) {
 	topic := c.topicIOSAlert
 	if platform == "watchOS" {
 		topic = c.topicWatchAlert
@@ -115,14 +133,29 @@ func (c *Client) incomingAccountCall(ctx context.Context, platform, deviceToken,
 			"alert": map[string]string{"title": "WiFi Secure Call", "body": "Incoming Wi-Fi call"},
 			"sound": "default", "category": "INCOMING_CALL", "interruption-level": "time-sensitive",
 		},
-		"event": "incoming_call_v2", "serverCallID": callID, "accountID": accountID,
+		"event": event, "serverCallID": callID, "accountID": accountID,
+	}
+	if event == "incoming_call_v3" {
+		bodyValue["callerUsername"] = callerUsername
+		bodyValue["callerPublicIdentity"] = "wsc:user:" + callerUsername
+		if callerDisplayName != "" {
+			bodyValue["callerDisplayName"] = callerDisplayName
+		}
+		bodyValue["aps"].(map[string]any)["alert"] = map[string]string{"title": "WiFi Secure Call", "body": "Incoming call from @" + callerUsername}
 	}
 	if platform == "watchOS" && pushType == "alert" {
 		bodyValue["aps"].(map[string]any)["content-available"] = 1
 	}
 	if pushType == "voip" {
 		expiration = 0
-		bodyValue = map[string]any{"aps": map[string]any{"content-available": 1}, "event": "incoming_call_v2", "serverCallID": callID, "accountID": accountID}
+		bodyValue = map[string]any{"aps": map[string]any{"content-available": 1}, "event": event, "serverCallID": callID, "accountID": accountID}
+		if event == "incoming_call_v3" {
+			bodyValue["callerUsername"] = callerUsername
+			bodyValue["callerPublicIdentity"] = "wsc:user:" + callerUsername
+			if callerDisplayName != "" {
+				bodyValue["callerDisplayName"] = callerDisplayName
+			}
+		}
 		if platform == "watchOS" {
 			topic = c.topicWatchVoIP
 		} else {
