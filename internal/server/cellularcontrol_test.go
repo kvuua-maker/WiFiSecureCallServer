@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -274,47 +275,35 @@ func TestRemoteCellularControlCreateIsIdempotentAndCancelDoesNotTerminateCarrier
 	if response.Code != http.StatusOK {
 		t.Fatalf("create status=%d", response.Code)
 	}
-	if err := fixture.auth.InvalidateAccountDeviceToken(
-		fixture.targetIOS.Account.AccountID, fixture.targetIOS.DeviceID, "alert", strings.Repeat("c", 64), 1,
-	); err != nil {
-		t.Fatal(err)
+	fixture.server.cellularControlCreationMu.Lock()
+	retryDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		retryDone <- performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls", fixture.targetWatch.AccessToken, body)
+	}()
+	select {
+	case early := <-retryDone:
+		fixture.server.cellularControlCreationMu.Unlock()
+		t.Fatalf("retry bypassed serialized selection status=%d", early.Code)
+	case <-time.After(25 * time.Millisecond):
 	}
-	retry := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls", fixture.targetWatch.AccessToken, body)
+	invalidateErr := fixture.auth.InvalidateAccountDeviceToken(
+		fixture.targetIOS.Account.AccountID, fixture.targetIOS.DeviceID, "alert", strings.Repeat("c", 64), 1,
+	)
+	fixture.server.cellularControlCreationMu.Unlock()
+	if invalidateErr != nil {
+		t.Fatal(invalidateErr)
+	}
+	retry := <-retryDone
 	if retry.Code != http.StatusOK || decodeCellularControlView(t, retry.Body.Bytes()).RequestID != controlID {
 		t.Fatalf("retry after eligibility changed status=%d body=%q", retry.Code, retry.Body.String())
 	}
-	if got := len(waitForRemotePush(t, fake, 1)); got != 1 {
+	waitForRemotePush(t, fake, 1)
+	time.Sleep(25 * time.Millisecond)
+	if got := len(fake.snapshot()); got != 1 {
 		t.Fatalf("push count=%d", got)
 	}
 	cancelled := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/cancel", fixture.targetWatch.AccessToken, map[string]string{"requestID": "c1111111-1111-4111-8111-111111111111"})
 	if cancelled.Code != http.StatusOK || decodeCellularControlView(t, cancelled.Body.Bytes()).State != cellularcontrol.Cancelled {
 		t.Fatalf("cancel status=%d body=%q", cancelled.Code, cancelled.Body.String())
-	}
-}
-
-func TestRemoteCellularControlConcurrentCreateIsSerializedAndIdempotent(t *testing.T) {
-	fixture, fake := prepareRemoteControlFixture(t)
-	controlID := "b4444444-4444-4444-8444-444444444444"
-	body := map[string]string{"requestID": controlID, "phoneNumber": "+380501234567"}
-	const requests = 24
-	status := make(chan int, requests)
-	var group sync.WaitGroup
-	for range requests {
-		group.Add(1)
-		go func() {
-			defer group.Done()
-			response := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls", fixture.targetWatch.AccessToken, body)
-			status <- response.Code
-		}()
-	}
-	group.Wait()
-	close(status)
-	for code := range status {
-		if code != http.StatusOK {
-			t.Fatalf("concurrent create status=%d", code)
-		}
-	}
-	if got := len(waitForRemotePush(t, fake, 1)); got != 1 {
-		t.Fatalf("push count=%d", got)
 	}
 }
