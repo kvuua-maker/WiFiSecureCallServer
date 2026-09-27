@@ -142,10 +142,7 @@ func (c *Client) RemoteCellularControl(ctx context.Context, deviceToken, request
 
 func (c *Client) remoteCellularControl(ctx context.Context, deviceToken, requestID string, expiresAt time.Time, accountID string) (Result, error) {
 	body, _ := json.Marshal(map[string]any{
-		"aps": map[string]any{
-			"alert": map[string]string{"title": "WiFi Secure Call", "body": "Remote cellular request ready"},
-			"sound": "default", "category": "REMOTE_CELLULAR_CONTROL", "content-available": 1,
-		},
+		"aps":   map[string]any{"content-available": 1},
 		"event": "remote_cellular_control", "requestID": requestID, "accountID": accountID,
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.push.apple.com/3/device/"+deviceToken, strings.NewReader(string(body)))
@@ -158,8 +155,8 @@ func (c *Client) remoteCellularControl(ctx context.Context, deviceToken, request
 	}
 	req.Header.Set("authorization", "bearer "+token)
 	req.Header.Set("apns-topic", c.topicIOSAlert)
-	req.Header.Set("apns-push-type", "alert")
-	req.Header.Set("apns-priority", "10")
+	req.Header.Set("apns-push-type", "background")
+	req.Header.Set("apns-priority", "5")
 	req.Header.Set("apns-expiration", fmt.Sprint(expiresAt.Unix()))
 	req.Header.Set("content-type", "application/json")
 	resp, err := c.http.Do(req)

@@ -183,23 +183,35 @@ func TestUserIncomingCallCarriesSafeCallerIdentityAndOneLogicalCallID(t *testing
 	}
 }
 
-func TestRemoteCellularControlUsesOpaqueIdentifierOnly(t *testing.T) {
+func TestRemoteCellularControlUsesBackgroundDeliveryAndOpaqueIdentifiersOnly(t *testing.T) {
 	var captured capturedAPNSRequest
 	client := testClient(t, &captured)
 	requestID := "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 	accountID := "11111111-2222-4333-8444-555555555555"
-	if _, err := client.RemoteCellularControl(context.Background(), "0123456789abcdef", requestID, time.Now().Add(2*time.Minute), accountID); err != nil {
+	expiresAt := time.Unix(1_800_000_120, 987_654_321)
+	if _, err := client.RemoteCellularControl(context.Background(), "0123456789abcdef", requestID, expiresAt, accountID); err != nil {
 		t.Fatal(err)
 	}
-	if captured.header.Get("apns-topic") != "com.vkapps.wifisecurecall" || captured.header.Get("apns-push-type") != "alert" || captured.header.Get("apns-priority") != "10" {
+	if captured.header.Get("apns-topic") != "com.vkapps.wifisecurecall" || captured.header.Get("apns-push-type") != "background" || captured.header.Get("apns-priority") != "5" {
 		t.Fatalf("headers=%v", captured.header)
+	}
+	if got := captured.header.Get("apns-expiration"); got != "1800000120" {
+		t.Fatalf("expiration=%q", got)
 	}
 	if captured.payload["event"] != "remote_cellular_control" || captured.payload["requestID"] != requestID || captured.payload["accountID"] != accountID {
 		t.Fatalf("payload=%#v", captured.payload)
 	}
 	aps, ok := captured.payload["aps"].(map[string]any)
-	if !ok || aps["category"] != "REMOTE_CELLULAR_CONTROL" || aps["content-available"] != float64(1) {
+	if !ok || len(aps) != 1 || aps["content-available"] != float64(1) {
 		t.Fatalf("aps=%#v", captured.payload["aps"])
+	}
+	for _, forbidden := range []string{"alert", "sound", "badge", "category"} {
+		if _, exists := aps[forbidden]; exists {
+			t.Fatalf("background aps contains %q: %#v", forbidden, aps)
+		}
+	}
+	if len(captured.payload) != 4 {
+		t.Fatalf("unexpected custom payload fields: %#v", captured.payload)
 	}
 	encoded, err := json.Marshal(captured.payload)
 	if err != nil {
