@@ -30,6 +30,9 @@ type AccountSender interface {
 type UserCallSender interface {
 	IncomingUserCall(context.Context, string, string, string, string, time.Time, string, string, string) (Result, error)
 }
+type RemoteCellularControlSender interface {
+	RemoteCellularControl(context.Context, string, string, time.Time, string) (Result, error)
+}
 type Result struct {
 	Status                            int
 	Reason, APNSID                    string
@@ -45,6 +48,9 @@ func (Disabled) IncomingAccountCall(context.Context, string, string, string, str
 	return Result{}, errors.New("APNs disabled")
 }
 func (Disabled) IncomingUserCall(context.Context, string, string, string, string, time.Time, string, string, string) (Result, error) {
+	return Result{}, errors.New("APNs disabled")
+}
+func (Disabled) RemoteCellularControl(context.Context, string, string, time.Time, string) (Result, error) {
 	return Result{}, errors.New("APNs disabled")
 }
 func (Disabled) Configured() bool { return false }
@@ -120,6 +126,73 @@ func (c *Client) IncomingUserCall(ctx context.Context, platform, deviceToken, ca
 		return c.incomingAccountCall(ctx, platform, deviceToken, callID, pushType, ringExpiresAt, accountID, "incoming_call_v3", callerUsername, callerDisplayName)
 	}
 	return result, err
+}
+
+func (c *Client) RemoteCellularControl(ctx context.Context, deviceToken, requestID string, expiresAt time.Time, accountID string) (Result, error) {
+	result, err := c.remoteCellularControl(ctx, deviceToken, requestID, expiresAt, accountID)
+	if result.Reason == "ExpiredProviderToken" {
+		c.mu.Lock()
+		c.jwt = ""
+		c.jwtAt = time.Time{}
+		c.mu.Unlock()
+		return c.remoteCellularControl(ctx, deviceToken, requestID, expiresAt, accountID)
+	}
+	return result, err
+}
+
+func (c *Client) remoteCellularControl(ctx context.Context, deviceToken, requestID string, expiresAt time.Time, accountID string) (Result, error) {
+	body, _ := json.Marshal(map[string]any{
+		"aps": map[string]any{
+			"alert": map[string]string{"title": "WiFi Secure Call", "body": "Remote cellular request ready"},
+			"sound": "default", "category": "REMOTE_CELLULAR_CONTROL", "content-available": 1,
+		},
+		"event": "remote_cellular_control", "requestID": requestID, "accountID": accountID,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.push.apple.com/3/device/"+deviceToken, strings.NewReader(string(body)))
+	if err != nil {
+		return Result{}, err
+	}
+	token, err := c.bearer()
+	if err != nil {
+		return Result{}, err
+	}
+	req.Header.Set("authorization", "bearer "+token)
+	req.Header.Set("apns-topic", c.topicIOSAlert)
+	req.Header.Set("apns-push-type", "alert")
+	req.Header.Set("apns-priority", "10")
+	req.Header.Set("apns-expiration", fmt.Sprint(expiresAt.Unix()))
+	req.Header.Set("content-type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return Result{}, err
+	}
+	defer resp.Body.Close()
+	result := readResult(resp)
+	if resp.StatusCode/100 != 2 {
+		return result, fmt.Errorf("APNs status %d reason %s", resp.StatusCode, result.Reason)
+	}
+	return result, nil
+}
+
+func readResult(resp *http.Response) Result {
+	reason := "Success"
+	var apnsTimestamp time.Time
+	if resp.StatusCode/100 != 2 {
+		var payload struct {
+			Reason    string `json:"reason"`
+			Timestamp int64  `json:"timestamp"`
+		}
+		limited, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if json.Unmarshal(limited, &payload) == nil && payload.Reason != "" {
+			reason = payload.Reason
+		} else {
+			reason = "Unknown"
+		}
+		if payload.Timestamp > 0 {
+			apnsTimestamp = time.UnixMilli(payload.Timestamp).UTC()
+		}
+	}
+	return Result{Status: resp.StatusCode, Reason: reason, APNSID: resp.Header.Get("apns-id"), Timestamp: apnsTimestamp, Retryable: resp.StatusCode == 429 || resp.StatusCode >= 500, DeadToken: resp.StatusCode == 410 || reason == "BadDeviceToken" || reason == "DeviceTokenNotForTopic" || reason == "Unregistered", AuthFailure: reason == "ExpiredProviderToken" || reason == "InvalidProviderToken"}
 }
 
 func (c *Client) incomingAccountCall(ctx context.Context, platform, deviceToken, callID, pushType string, ringExpiresAt time.Time, accountID, event, callerUsername, callerDisplayName string) (Result, error) {

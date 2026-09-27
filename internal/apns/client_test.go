@@ -182,3 +182,32 @@ func TestUserIncomingCallCarriesSafeCallerIdentityAndOneLogicalCallID(t *testing
 		}
 	}
 }
+
+func TestRemoteCellularControlUsesOpaqueIdentifierOnly(t *testing.T) {
+	var captured capturedAPNSRequest
+	client := testClient(t, &captured)
+	requestID := "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	accountID := "11111111-2222-4333-8444-555555555555"
+	if _, err := client.RemoteCellularControl(context.Background(), "0123456789abcdef", requestID, time.Now().Add(2*time.Minute), accountID); err != nil {
+		t.Fatal(err)
+	}
+	if captured.header.Get("apns-topic") != "com.vkapps.wifisecurecall" || captured.header.Get("apns-push-type") != "alert" || captured.header.Get("apns-priority") != "10" {
+		t.Fatalf("headers=%v", captured.header)
+	}
+	if captured.payload["event"] != "remote_cellular_control" || captured.payload["requestID"] != requestID || captured.payload["accountID"] != accountID {
+		t.Fatalf("payload=%#v", captured.payload)
+	}
+	aps, ok := captured.payload["aps"].(map[string]any)
+	if !ok || aps["category"] != "REMOTE_CELLULAR_CONTROL" || aps["content-available"] != float64(1) {
+		t.Fatalf("aps=%#v", captured.payload["aps"])
+	}
+	encoded, err := json.Marshal(captured.payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"+380501234567", "phoneNumber", "tel:", "telephony:", "accessToken", "refreshToken"} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("payload exposed %q: %s", forbidden, encoded)
+		}
+	}
+}

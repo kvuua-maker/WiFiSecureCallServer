@@ -17,6 +17,7 @@ import (
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/accountmedia"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/apns"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/calls"
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/cellularcontrol"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/devices"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/media"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/phoneauth"
@@ -24,17 +25,18 @@ import (
 )
 
 type Server struct {
-	callCreationMu sync.Mutex
-	tokenA, tokenB string
-	calls          *calls.Store
-	devices        *devices.Store
-	apns           apns.Sender
-	media          *media.Hub
-	mux            *http.ServeMux
-	phoneAuth      *phoneauth.Service
-	accountCalls   *accountcalls.Store
-	userCalls      *usercalls.Store
-	accountMedia   *accountmedia.Hub
+	callCreationMu   sync.Mutex
+	tokenA, tokenB   string
+	calls            *calls.Store
+	devices          *devices.Store
+	apns             apns.Sender
+	media            *media.Hub
+	mux              *http.ServeMux
+	phoneAuth        *phoneauth.Service
+	accountCalls     *accountcalls.Store
+	userCalls        *usercalls.Store
+	accountMedia     *accountmedia.Hub
+	cellularControls *cellularcontrol.Store
 }
 
 func New(tokenA, tokenB string, callStore *calls.Store, deviceStore *devices.Store, push apns.Sender) *Server {
@@ -59,6 +61,9 @@ func NewWithV2Calls(tokenA, tokenB string, callStore *calls.Store, deviceStore *
 
 func NewWithCallStores(tokenA, tokenB string, callStore *calls.Store, deviceStore *devices.Store, push apns.Sender, auth *phoneauth.Service, accountCallStore *accountcalls.Store, userCallStore *usercalls.Store) *Server {
 	s := &Server{tokenA: tokenA, tokenB: tokenB, calls: callStore, devices: deviceStore, apns: push, phoneAuth: auth, accountCalls: accountCallStore, userCalls: userCallStore}
+	if auth != nil {
+		s.cellularControls = cellularcontrol.New(cellularcontrol.DefaultTTL)
+	}
 	s.media = media.New(callStore)
 	if accountCallStore != nil || userCallStore != nil {
 		s.accountMedia = accountmedia.New(combinedCallValidator{account: accountCallStore, user: userCallStore})
@@ -80,6 +85,9 @@ func (s *Server) Shutdown() {
 	s.media.CloseAll("server restart")
 	if s.accountMedia != nil {
 		s.accountMedia.CloseAll("server restart")
+	}
+	if s.cellularControls != nil {
+		s.cellularControls.Close()
 	}
 }
 

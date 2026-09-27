@@ -20,6 +20,9 @@ func (s *Server) registerV3() {
 	s.mux.HandleFunc("POST /v3/calls", s.v2Auth(s.createUserCall))
 	s.mux.HandleFunc("GET /v3/calls/{id}", s.v2Auth(s.getUserCall))
 	s.mux.HandleFunc("POST /v3/calls/{id}/{action}", s.v2Auth(s.mutateUserCall))
+	s.mux.HandleFunc("POST /v3/cellular-controls", s.v2Auth(s.createCellularControl))
+	s.mux.HandleFunc("GET /v3/cellular-controls/{id}", s.v2Auth(s.getCellularControl))
+	s.mux.HandleFunc("POST /v3/cellular-controls/{id}/{action}", s.v2Auth(s.mutateCellularControl))
 }
 
 type appleSignInRequest struct{ RequestID, DeviceID, Platform, IdentityToken, AuthorizationCode, Nonce, DisplayName, Email string }
