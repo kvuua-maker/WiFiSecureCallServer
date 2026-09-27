@@ -134,6 +134,62 @@ func TestRemoteCellularTargetSelectionRequiresReadyIPhoneAndPrefersSameAccount(t
 	if !ok || selected.DeviceID != sameAccount.DeviceID {
 		t.Fatalf("selected=%+v ok=%v", selected, ok)
 	}
+
+	visibleNotificationsDenied := sameAccount
+	visibleNotificationsDenied.Capabilities.NotificationsAuthorized = false
+	selected, ok = selectRemoteCellularIPhone(source, []accounts.Device{visibleNotificationsDenied})
+	if !ok || selected.DeviceID != visibleNotificationsDenied.DeviceID {
+		t.Fatalf("silent-push target with visible notifications denied was rejected: selected=%+v ok=%v", selected, ok)
+	}
+
+	invalidTargets := []struct {
+		name   string
+		mutate func(*accounts.Device)
+	}{
+		{name: "missing token", mutate: func(value *accounts.Device) { value.AlertToken = "" }},
+		{name: "alert registration absent", mutate: func(value *accounts.Device) { value.Capabilities.AlertPush = false }},
+		{name: "wrong platform", mutate: func(value *accounts.Device) { value.Platform = "watchOS" }},
+		{name: "wrong environment", mutate: func(value *accounts.Device) { value.Environment = "development" }},
+	}
+	for _, testCase := range invalidTargets {
+		t.Run(testCase.name, func(t *testing.T) {
+			value := sameAccount
+			testCase.mutate(&value)
+			if selected, ok := selectRemoteCellularIPhone(source, []accounts.Device{value}); ok {
+				t.Fatalf("invalid target selected: %+v", selected)
+			}
+		})
+	}
+}
+
+func TestRemoteCellularControlNeverSelectsAnotherUsersIPhone(t *testing.T) {
+	fixture, fake := prepareRemoteControlFixture(t)
+	unrelatedIdentity, err := fixture.auth.Authenticate(fixture.unrelated.AccessToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.auth.RegisterDevice(unrelatedIdentity, phoneauth.DeviceRegistration{
+		RequestID: "a2222222-2222-4222-8222-222222222222", DeviceID: fixture.unrelated.DeviceID,
+		Platform: "iOS", PushType: "alert", Token: strings.Repeat("d", 64), InstallationGeneration: 1,
+		Environment: "production", Capabilities: accounts.DeviceCapabilities{AlertPush: true, NotificationsAuthorized: false, MicrophoneReady: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.auth.InvalidateAccountDeviceToken(
+		fixture.targetIOS.Account.AccountID, fixture.targetIOS.DeviceID, "alert", strings.Repeat("c", 64), 1,
+	); err != nil {
+		t.Fatal(err)
+	}
+	response := performUserRequest(
+		t, fixture.server, http.MethodPost, "/v3/cellular-controls", fixture.targetWatch.AccessToken,
+		map[string]string{"requestID": "b9999999-9999-4999-8999-999999999999", "phoneNumber": "+380501234567"},
+	)
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "iphone_unavailable") {
+		t.Fatalf("status=%d body=%q", response.Code, response.Body.String())
+	}
+	if got := len(fake.snapshot()); got != 0 {
+		t.Fatalf("unexpected push to another user's device: %d", got)
+	}
 }
 
 func TestRemoteCellularControlSameOwnerWatchToIPhoneLifecycle(t *testing.T) {

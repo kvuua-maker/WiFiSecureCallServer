@@ -193,7 +193,9 @@ func cellularControlParticipant(identity phoneauth.Identity) cellularcontrol.Par
 func selectRemoteCellularIPhone(source phoneauth.Identity, devices []accounts.Device) (accounts.Device, bool) {
 	candidates := make([]accounts.Device, 0)
 	for _, device := range devices {
-		if device.Platform != "iOS" || device.Environment != "production" || device.AlertToken == "" || !device.Capabilities.AlertPush || !device.Capabilities.NotificationsAuthorized {
+		// Remote cellular control uses a silent background notification. Visible
+		// alert authorization is not required for that APNs delivery class.
+		if device.Platform != "iOS" || device.Environment != "production" || device.AlertToken == "" || !device.Capabilities.AlertPush {
 			continue
 		}
 		candidates = append(candidates, device)
