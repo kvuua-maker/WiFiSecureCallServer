@@ -51,6 +51,8 @@ func (s *Server) createCellularControl(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "same_owner_required")
 		return
 	}
+	s.cellularControlCreationMu.Lock()
+	defer s.cellularControlCreationMu.Unlock()
 	if existing, found, err := s.cellularControls.ExistingCreate(body.RequestID, source, body.PhoneNumber); err != nil {
 		writeCellularControlError(w, err)
 		return

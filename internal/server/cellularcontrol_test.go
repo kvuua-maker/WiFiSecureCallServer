@@ -291,3 +291,30 @@ func TestRemoteCellularControlCreateIsIdempotentAndCancelDoesNotTerminateCarrier
 		t.Fatalf("cancel status=%d body=%q", cancelled.Code, cancelled.Body.String())
 	}
 }
+
+func TestRemoteCellularControlConcurrentCreateIsSerializedAndIdempotent(t *testing.T) {
+	fixture, fake := prepareRemoteControlFixture(t)
+	controlID := "b4444444-4444-4444-8444-444444444444"
+	body := map[string]string{"requestID": controlID, "phoneNumber": "+380501234567"}
+	const requests = 24
+	status := make(chan int, requests)
+	var group sync.WaitGroup
+	for range requests {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			response := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls", fixture.targetWatch.AccessToken, body)
+			status <- response.Code
+		}()
+	}
+	group.Wait()
+	close(status)
+	for code := range status {
+		if code != http.StatusOK {
+			t.Fatalf("concurrent create status=%d", code)
+		}
+	}
+	if got := len(waitForRemotePush(t, fake, 1)); got != 1 {
+		t.Fatalf("push count=%d", got)
+	}
+}
