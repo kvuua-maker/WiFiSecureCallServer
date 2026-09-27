@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
-	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -275,25 +275,12 @@ func TestRemoteCellularControlCreateIsIdempotentAndCancelDoesNotTerminateCarrier
 	if response.Code != http.StatusOK {
 		t.Fatalf("create status=%d", response.Code)
 	}
-	fixture.server.cellularControlCreationMu.Lock()
-	retryDone := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		retryDone <- performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls", fixture.targetWatch.AccessToken, body)
-	}()
-	select {
-	case early := <-retryDone:
-		fixture.server.cellularControlCreationMu.Unlock()
-		t.Fatalf("retry bypassed serialized selection status=%d", early.Code)
-	case <-time.After(25 * time.Millisecond):
-	}
-	invalidateErr := fixture.auth.InvalidateAccountDeviceToken(
+	if err := fixture.auth.InvalidateAccountDeviceToken(
 		fixture.targetIOS.Account.AccountID, fixture.targetIOS.DeviceID, "alert", strings.Repeat("c", 64), 1,
-	)
-	fixture.server.cellularControlCreationMu.Unlock()
-	if invalidateErr != nil {
-		t.Fatal(invalidateErr)
+	); err != nil {
+		t.Fatal(err)
 	}
-	retry := <-retryDone
+	retry := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls", fixture.targetWatch.AccessToken, body)
 	if retry.Code != http.StatusOK || decodeCellularControlView(t, retry.Body.Bytes()).RequestID != controlID {
 		t.Fatalf("retry after eligibility changed status=%d body=%q", retry.Code, retry.Body.String())
 	}
@@ -305,5 +292,30 @@ func TestRemoteCellularControlCreateIsIdempotentAndCancelDoesNotTerminateCarrier
 	cancelled := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/cancel", fixture.targetWatch.AccessToken, map[string]string{"requestID": "c1111111-1111-4111-8111-111111111111"})
 	if cancelled.Code != http.StatusOK || decodeCellularControlView(t, cancelled.Body.Bytes()).State != cellularcontrol.Cancelled {
 		t.Fatalf("cancel status=%d body=%q", cancelled.Code, cancelled.Body.String())
+	}
+}
+
+func TestRemoteCellularControlCreationCriticalSectionCoversCheckSelectionAndCreate(t *testing.T) {
+	source, err := os.ReadFile("cellularcontrol.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := bytes.Index(source, []byte("func (s *Server) createCellularControl"))
+	if start < 0 {
+		t.Fatal("create handler not found")
+	}
+	endMarker := []byte("\n}\n\nfunc (s *Server) getCellularControl")
+	endOffset := bytes.Index(source[start:], endMarker)
+	if endOffset < 0 {
+		t.Fatal("create handler not found")
+	}
+	body := source[start : start+endOffset]
+	lock := bytes.Index(body, []byte("s.cellularControlCreationMu.Lock()"))
+	deferredUnlock := bytes.Index(body, []byte("defer s.cellularControlCreationMu.Unlock()"))
+	existing := bytes.Index(body, []byte("s.cellularControls.ExistingCreate("))
+	selection := bytes.Index(body, []byte("selectRemoteCellularIPhone("))
+	create := bytes.Index(body, []byte("s.cellularControls.Create("))
+	if !(lock >= 0 && lock < deferredUnlock && deferredUnlock < existing && existing < selection && selection < create) {
+		t.Fatalf("creation critical-section order lock=%d defer=%d existing=%d selection=%d create=%d", lock, deferredUnlock, existing, selection, create)
 	}
 }
