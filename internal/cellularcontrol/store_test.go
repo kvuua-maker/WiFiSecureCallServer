@@ -73,7 +73,7 @@ func TestOnlySnapshottedParticipantsCanReadOrMutate(t *testing.T) {
 	if _, err := store.Get(id, outsider); errorCode(err) != "request_not_participant" {
 		t.Fatalf("outsider get err=%v", err)
 	}
-	if _, err := store.Receive(id, "66666666-6666-4666-8666-666666666666", source); errorCode(err) != "request_not_participant" {
+	if _, err := store.Receive(id, "66666666-6666-4666-8666-666666666666", source, ReceiptBackground); errorCode(err) != "request_not_participant" {
 		t.Fatalf("source receive err=%v", err)
 	}
 	if _, err := store.Cancel(id, "77777777-7777-4777-8777-777777777777", target); errorCode(err) != "request_not_participant" {
@@ -92,7 +92,7 @@ func TestReceiveDeliveryAndAtomicClaimAllowExactlyOneStart(t *testing.T) {
 	if view, err := store.MarkDelivery(id, true); err != nil || view.DeliveryStatus != "submission_accepted" || view.State != DeliveryPending {
 		t.Fatalf("delivery view=%+v err=%v", view, err)
 	}
-	if view, err := store.Receive(id, "66666666-6666-4666-8666-666666666666", target); err != nil || view.State != IPhoneActionRequired {
+	if view, err := store.Receive(id, "66666666-6666-4666-8666-666666666666", target, ReceiptForeground); err != nil || view.State != IPhoneActionRequired || view.ReceiptContext != ReceiptForeground {
 		t.Fatalf("receive view=%+v err=%v", view, err)
 	}
 
@@ -131,7 +131,7 @@ func TestDuplicateStartMutationNeverReleasesPhoneTwice(t *testing.T) {
 	if _, _, err := store.Create(id, source, target, testPhone); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Receive(id, "77777777-7777-4777-8777-777777777777", target); err != nil {
+	if _, err := store.Receive(id, "77777777-7777-4777-8777-777777777777", target, ReceiptBackground); err != nil {
 		t.Fatal(err)
 	}
 	first, err := store.ClaimStart(id, mutation, target)
@@ -142,8 +142,100 @@ func TestDuplicateStartMutationNeverReleasesPhoneTwice(t *testing.T) {
 	if err != nil || duplicate.PhoneNumber != "" || duplicate.MutationApplied == nil || *duplicate.MutationApplied {
 		t.Fatalf("duplicate=%+v err=%v", duplicate, err)
 	}
-	if view, err := store.MarkStartRequested(id, "88888888-8888-4888-8888-888888888888", target); err != nil || view.State != IPhoneStartRequested {
-		t.Fatalf("start requested view=%+v err=%v", view, err)
+	if view, err := store.MarkStartAttempted(id, "88888888-8888-4888-8888-888888888888", target); err != nil || view.State != IPhoneBackgroundStartAttempted {
+		t.Fatalf("start attempted view=%+v err=%v", view, err)
+	}
+	if view, err := store.MarkStartResult(id, "99999999-9999-4999-8999-999999999999", target, StartAccepted, "", nil); err != nil || view.State != SystemStartAccepted || view.StartResult != StartAccepted {
+		t.Fatalf("start result view=%+v err=%v", view, err)
+	}
+}
+
+func TestBackgroundPublicStartErrorIsSafeVisibleAndImmutable(t *testing.T) {
+	store := New(time.Minute)
+	defer store.Close()
+	source, target := participants()
+	id := "55555555-5555-4555-8555-555555555555"
+	if _, _, err := store.Create(id, source, target, testPhone); err != nil {
+		t.Fatal(err)
+	}
+	received, err := store.Receive(id, "66666666-6666-4666-8666-666666666666", target, ReceiptBackground)
+	if err != nil || received.State != IPhoneBackgroundReceived || received.ReceiptContext != ReceiptBackground || received.ReceivedAt == nil {
+		t.Fatalf("received=%+v err=%v", received, err)
+	}
+	grant, err := store.ClaimStart(id, "77777777-7777-4777-8777-777777777777", target)
+	if err != nil || grant.PhoneNumber != testPhone {
+		t.Fatalf("grant=%+v err=%v", grant, err)
+	}
+	store.mu.Lock()
+	phoneAfterClaim := store.controls[id].phoneNumber
+	store.mu.Unlock()
+	if phoneAfterClaim != "" {
+		t.Fatal("phone remained after claim")
+	}
+	attempted, err := store.MarkStartAttempted(id, "88888888-8888-4888-8888-888888888888", target)
+	if err != nil || attempted.State != IPhoneBackgroundStartAttempted || attempted.ReceivedAt == nil || attempted.StartAttemptedAt == nil {
+		t.Fatalf("attempted=%+v err=%v", attempted, err)
+	}
+	code := 7
+	failed, err := store.MarkStartResult(id, "99999999-9999-4999-8999-999999999999", target, StartError, SafePublicErrorDomain, &code)
+	if err != nil || failed.State != PublicStartError || failed.StartResult != StartError || failed.SafeErrorDomain != SafePublicErrorDomain || failed.SafeErrorCode == nil || *failed.SafeErrorCode != code || failed.ReceivedAt == nil || failed.StartAttemptedAt == nil || failed.StartResultAt == nil {
+		t.Fatalf("failed=%+v err=%v", failed, err)
+	}
+	encoded, err := json.Marshal(failed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contains(string(encoded), testPhone) || contains(string(encoded), "localizedDescription") {
+		t.Fatalf("unsafe public result: %s", encoded)
+	}
+	duplicate, err := store.MarkStartResult(id, "99999999-9999-4999-8999-999999999999", target, StartError, SafePublicErrorDomain, &code)
+	if err != nil || duplicate.MutationApplied == nil || *duplicate.MutationApplied || duplicate.State != PublicStartError {
+		t.Fatalf("duplicate=%+v err=%v", duplicate, err)
+	}
+	if _, err := store.MarkStartResult(id, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", target, StartAccepted, "", nil); errorCode(err) != "system_start_result_already_reported" {
+		t.Fatalf("conflicting result err=%v", err)
+	}
+}
+
+func TestReceiptContextIsFirstObservedAndValidated(t *testing.T) {
+	store := New(time.Minute)
+	defer store.Close()
+	source, target := participants()
+	id := "55555555-5555-4555-8555-555555555555"
+	if _, _, err := store.Create(id, source, target, testPhone); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Receive(id, "66666666-6666-4666-8666-666666666666", target, ReceiptContext("invented")); errorCode(err) != "invalid_request" {
+		t.Fatalf("invalid context err=%v", err)
+	}
+	first, err := store.Receive(id, "77777777-7777-4777-8777-777777777777", target, ReceiptBackground)
+	if err != nil || first.ReceiptContext != ReceiptBackground {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	second, err := store.Receive(id, "88888888-8888-4888-8888-888888888888", target, ReceiptForeground)
+	if err != nil || second.ReceiptContext != ReceiptBackground || second.MutationApplied == nil || *second.MutationApplied {
+		t.Fatalf("second=%+v err=%v", second, err)
+	}
+}
+
+func TestInactiveReceiptUsesBackgroundAttemptPath(t *testing.T) {
+	store := New(time.Minute)
+	defer store.Close()
+	source, target := participants()
+	id := "55555555-5555-4555-8555-555555555555"
+	if _, _, err := store.Create(id, source, target, testPhone); err != nil {
+		t.Fatal(err)
+	}
+	received, err := store.Receive(id, "66666666-6666-4666-8666-666666666666", target, ReceiptInactive)
+	if err != nil || received.State != IPhoneBackgroundReceived || received.ReceiptContext != ReceiptInactive {
+		t.Fatalf("received=%+v err=%v", received, err)
+	}
+	if _, err := store.ClaimStart(id, "77777777-7777-4777-8777-777777777777", target); err != nil {
+		t.Fatal(err)
+	}
+	attempted, err := store.MarkStartAttempted(id, "88888888-8888-4888-8888-888888888888", target)
+	if err != nil || attempted.State != IPhoneBackgroundStartAttempted {
+		t.Fatalf("attempted=%+v err=%v", attempted, err)
 	}
 }
 
@@ -164,7 +256,7 @@ func TestCancellationBeforeStartAndHonestSemanticsAfterAuthorization(t *testing.
 	if _, _, err := store.Create(second, source, target, testPhone); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Receive(second, "88888888-8888-4888-8888-888888888888", target); err != nil {
+	if _, err := store.Receive(second, "88888888-8888-4888-8888-888888888888", target, ReceiptForeground); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.ClaimStart(second, "99999999-9999-4999-8999-999999999999", target); err != nil {
@@ -183,15 +275,83 @@ func TestTTLExpiresAndRedactsWithoutFurtherRequest(t *testing.T) {
 	if _, _, err := store.Create(id, source, target, testPhone); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.MarkDelivery(id, true); err != nil {
+		t.Fatal(err)
+	}
 	time.Sleep(80 * time.Millisecond)
 	view, err := store.Get(id, source)
-	if err != nil || view.State != Expired || view.TerminalReason != "request_expired" {
+	if err != nil || view.State != Expired || view.TerminalReason != "background_execution_not_observed" {
 		t.Fatalf("expired view=%+v err=%v", view, err)
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if store.controls[id].phoneNumber != "" {
 		t.Fatal("phone remained after expiry")
+	}
+}
+
+func TestUnsubmittedRequestExpiryIsNotReportedAsMissedBackgroundExecution(t *testing.T) {
+	store := New(20 * time.Millisecond)
+	defer store.Close()
+	source, target := participants()
+	id := "55555555-5555-4555-8555-555555555555"
+	if _, _, err := store.Create(id, source, target, testPhone); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(80 * time.Millisecond)
+	view, err := store.Get(id, target)
+	if err != nil || view.State != Expired || view.TerminalReason != "request_expired" {
+		t.Fatalf("expired view=%+v err=%v", view, err)
+	}
+}
+
+func TestAttemptWithoutPublicResultExpiresDistinctly(t *testing.T) {
+	store := New(20 * time.Millisecond)
+	defer store.Close()
+	source, target := participants()
+	id := "55555555-5555-4555-8555-555555555555"
+	if _, _, err := store.Create(id, source, target, testPhone); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Receive(id, "66666666-6666-4666-8666-666666666666", target, ReceiptBackground); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimStart(id, "77777777-7777-4777-8777-777777777777", target); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkStartAttempted(id, "88888888-8888-4888-8888-888888888888", target); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(80 * time.Millisecond)
+	view, err := store.Get(id, source)
+	if err != nil || view.State != Expired || view.TerminalReason != "public_start_result_not_observed" {
+		t.Fatalf("expired attempt view=%+v err=%v", view, err)
+	}
+}
+
+func TestLateDeliveryResultCannotOverwriteProgressOrTerminalResult(t *testing.T) {
+	store := New(time.Minute)
+	defer store.Close()
+	source, target := participants()
+	id := "55555555-5555-4555-8555-555555555555"
+	if _, _, err := store.Create(id, source, target, testPhone); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Receive(id, "66666666-6666-4666-8666-666666666666", target, ReceiptBackground); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimStart(id, "77777777-7777-4777-8777-777777777777", target); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkStartAttempted(id, "88888888-8888-4888-8888-888888888888", target); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkStartResult(id, "99999999-9999-4999-8999-999999999999", target, StartAccepted, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.MarkDelivery(id, false)
+	if err != nil || view.State != SystemStartAccepted || view.DeliveryStatus != "submission_failed" {
+		t.Fatalf("late delivery view=%+v err=%v", view, err)
 	}
 }
 

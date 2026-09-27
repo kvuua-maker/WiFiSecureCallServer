@@ -23,6 +23,18 @@ type cellularControlMutationRequest struct {
 	RequestID string
 }
 
+type cellularControlReceiveRequest struct {
+	RequestID      string
+	ReceiptContext cellularcontrol.ReceiptContext
+}
+
+type cellularControlStartResultRequest struct {
+	RequestID       string
+	Result          cellularcontrol.StartResult
+	SafeErrorDomain string
+	SafeErrorCode   *int
+}
+
 func (s *Server) createCellularControl(w http.ResponseWriter, r *http.Request) {
 	if s.cellularControls == nil {
 		writeError(w, http.StatusServiceUnavailable, "control_unavailable")
@@ -75,36 +87,63 @@ func (s *Server) mutateCellularControl(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "control_unavailable")
 		return
 	}
-	var body cellularControlMutationRequest
-	if err := decode(w, r, &body); err != nil || !validID(body.RequestID) {
-		writeError(w, http.StatusBadRequest, "invalid_request")
-		return
-	}
 	id := r.PathValue("id")
 	participant := cellularControlParticipant(identityFrom(r.Context()))
 	switch r.PathValue("action") {
 	case "receive":
-		view, err := s.cellularControls.Receive(id, body.RequestID, participant)
+		var body cellularControlReceiveRequest
+		if err := decode(w, r, &body); err != nil || !validID(body.RequestID) || !cellularcontrol.ValidReceiptContext(body.ReceiptContext) {
+			writeError(w, http.StatusBadRequest, "invalid_request")
+			return
+		}
+		view, err := s.cellularControls.Receive(id, body.RequestID, participant, body.ReceiptContext)
 		if err != nil {
 			writeCellularControlError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, view)
 	case "start":
+		var body cellularControlMutationRequest
+		if err := decode(w, r, &body); err != nil || !validID(body.RequestID) {
+			writeError(w, http.StatusBadRequest, "invalid_request")
+			return
+		}
 		grant, err := s.cellularControls.ClaimStart(id, body.RequestID, participant)
 		if err != nil {
 			writeCellularControlError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, grant)
-	case "start-requested":
-		view, err := s.cellularControls.MarkStartRequested(id, body.RequestID, participant)
+	case "start-attempted":
+		var body cellularControlMutationRequest
+		if err := decode(w, r, &body); err != nil || !validID(body.RequestID) {
+			writeError(w, http.StatusBadRequest, "invalid_request")
+			return
+		}
+		view, err := s.cellularControls.MarkStartAttempted(id, body.RequestID, participant)
+		if err != nil {
+			writeCellularControlError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, view)
+	case "start-result":
+		var body cellularControlStartResultRequest
+		if err := decode(w, r, &body); err != nil || !validID(body.RequestID) || !validCellularStartResult(body) {
+			writeError(w, http.StatusBadRequest, "invalid_request")
+			return
+		}
+		view, err := s.cellularControls.MarkStartResult(id, body.RequestID, participant, body.Result, body.SafeErrorDomain, body.SafeErrorCode)
 		if err != nil {
 			writeCellularControlError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, view)
 	case "cancel":
+		var body cellularControlMutationRequest
+		if err := decode(w, r, &body); err != nil || !validID(body.RequestID) {
+			writeError(w, http.StatusBadRequest, "invalid_request")
+			return
+		}
 		view, err := s.cellularControls.Cancel(id, body.RequestID, participant)
 		if err != nil {
 			writeCellularControlError(w, err)
@@ -113,6 +152,17 @@ func (s *Server) mutateCellularControl(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, view)
 	default:
 		writeError(w, http.StatusNotFound, "unknown_action")
+	}
+}
+
+func validCellularStartResult(body cellularControlStartResultRequest) bool {
+	switch body.Result {
+	case cellularcontrol.StartAccepted:
+		return body.SafeErrorDomain == "" && body.SafeErrorCode == nil
+	case cellularcontrol.StartError:
+		return cellularcontrol.ValidSafeErrorDomain(body.SafeErrorDomain) && body.SafeErrorCode != nil && *body.SafeErrorCode >= -2147483648 && *body.SafeErrorCode <= 2147483647
+	default:
+		return false
 	}
 }
 

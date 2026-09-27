@@ -162,8 +162,9 @@ func TestRemoteCellularControlSameOwnerWatchToIPhoneLifecycle(t *testing.T) {
 		t.Fatal("phone appeared in ordinary logs")
 	}
 
-	received := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/receive", fixture.targetIOS.AccessToken, map[string]string{"requestID": "c1111111-1111-4111-8111-111111111111"})
-	if received.Code != http.StatusOK || decodeCellularControlView(t, received.Body.Bytes()).State != cellularcontrol.IPhoneActionRequired {
+	received := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/receive", fixture.targetIOS.AccessToken, map[string]string{"requestID": "c1111111-1111-4111-8111-111111111111", "receiptContext": "background"})
+	receivedView := decodeCellularControlView(t, received.Body.Bytes())
+	if received.Code != http.StatusOK || receivedView.State != cellularcontrol.IPhoneBackgroundReceived || receivedView.ReceiptContext != cellularcontrol.ReceiptBackground {
 		t.Fatalf("receive status=%d body=%q", received.Code, received.Body.String())
 	}
 	start := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/start", fixture.targetIOS.AccessToken, map[string]string{"requestID": "d1111111-1111-4111-8111-111111111111"})
@@ -182,9 +183,61 @@ func TestRemoteCellularControlSameOwnerWatchToIPhoneLifecycle(t *testing.T) {
 	if duplicate.Code != http.StatusOK || json.Unmarshal(duplicate.Body.Bytes(), &duplicateGrant) != nil || duplicateGrant.PhoneNumber != "" || duplicateGrant.MutationApplied == nil || *duplicateGrant.MutationApplied {
 		t.Fatalf("duplicate status=%d grant=%+v", duplicate.Code, duplicateGrant)
 	}
-	started := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/start-requested", fixture.targetIOS.AccessToken, map[string]string{"requestID": "e1111111-1111-4111-8111-111111111111"})
-	if started.Code != http.StatusOK || decodeCellularControlView(t, started.Body.Bytes()).State != cellularcontrol.IPhoneStartRequested {
-		t.Fatalf("started status=%d body=%q", started.Code, started.Body.String())
+	attempted := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/start-attempted", fixture.targetIOS.AccessToken, map[string]string{"requestID": "e1111111-1111-4111-8111-111111111111"})
+	if attempted.Code != http.StatusOK || decodeCellularControlView(t, attempted.Body.Bytes()).State != cellularcontrol.IPhoneBackgroundStartAttempted {
+		t.Fatalf("attempted status=%d body=%q", attempted.Code, attempted.Body.String())
+	}
+	accepted := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/start-result", fixture.targetIOS.AccessToken, map[string]any{"requestID": "f1111111-1111-4111-8111-111111111111", "result": "accepted"})
+	acceptedView := decodeCellularControlView(t, accepted.Body.Bytes())
+	if accepted.Code != http.StatusOK || acceptedView.State != cellularcontrol.SystemStartAccepted || acceptedView.StartResult != cellularcontrol.StartAccepted {
+		t.Fatalf("accepted status=%d body=%q", accepted.Code, accepted.Body.String())
+	}
+	watchView := performUserRequest(t, fixture.server, http.MethodGet, "/v3/cellular-controls/"+controlID, fixture.targetWatch.AccessToken, nil)
+	if watchView.Code != http.StatusOK || decodeCellularControlView(t, watchView.Body.Bytes()).State != cellularcontrol.SystemStartAccepted || strings.Contains(watchView.Body.String(), phone) {
+		t.Fatalf("watch view status=%d body=%q", watchView.Code, watchView.Body.String())
+	}
+}
+
+func TestRemoteCellularControlPublicStartErrorIsSafeAndWatchVisible(t *testing.T) {
+	fixture, _ := prepareRemoteControlFixture(t)
+	controlID := "b2222222-2222-4222-8222-222222222222"
+	phone := "+380501234567"
+	created := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls", fixture.targetWatch.AccessToken, map[string]string{"requestID": controlID, "phoneNumber": phone})
+	if created.Code != http.StatusOK {
+		t.Fatalf("create status=%d body=%q", created.Code, created.Body.String())
+	}
+	invalidContext := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/receive", fixture.targetIOS.AccessToken, map[string]string{"requestID": "c2222222-2222-4222-8222-222222222222", "receiptContext": "invented"})
+	if invalidContext.Code != http.StatusBadRequest {
+		t.Fatalf("invalid context status=%d body=%q", invalidContext.Code, invalidContext.Body.String())
+	}
+	received := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/receive", fixture.targetIOS.AccessToken, map[string]string{"requestID": "d2222222-2222-4222-8222-222222222222", "receiptContext": "background"})
+	if received.Code != http.StatusOK {
+		t.Fatalf("receive status=%d body=%q", received.Code, received.Body.String())
+	}
+	claimed := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/start", fixture.targetIOS.AccessToken, map[string]string{"requestID": "e2222222-2222-4222-8222-222222222222"})
+	if claimed.Code != http.StatusOK {
+		t.Fatalf("claim status=%d body=%q", claimed.Code, claimed.Body.String())
+	}
+	attempted := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/start-attempted", fixture.targetIOS.AccessToken, map[string]string{"requestID": "f2222222-2222-4222-8222-222222222222"})
+	if attempted.Code != http.StatusOK {
+		t.Fatalf("attempt status=%d body=%q", attempted.Code, attempted.Body.String())
+	}
+	unsafe := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/start-result", fixture.targetIOS.AccessToken, map[string]any{
+		"requestID": "a2222222-2222-4222-8222-222222222222", "result": "error", "safeErrorDomain": "tel.380501234567", "safeErrorCode": 7,
+	})
+	if unsafe.Code != http.StatusBadRequest {
+		t.Fatalf("unsafe result status=%d body=%q", unsafe.Code, unsafe.Body.String())
+	}
+	result := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/start-result", fixture.targetIOS.AccessToken, map[string]any{
+		"requestID": "b3333333-3333-4333-8333-333333333333", "result": "error", "safeErrorDomain": "PublicCellularAPI", "safeErrorCode": 7,
+	})
+	view := decodeCellularControlView(t, result.Body.Bytes())
+	if result.Code != http.StatusOK || view.State != cellularcontrol.PublicStartError || view.StartResult != cellularcontrol.StartError || view.SafeErrorDomain != cellularcontrol.SafePublicErrorDomain || view.SafeErrorCode == nil || *view.SafeErrorCode != 7 || view.ReceivedAt == nil || view.StartAttemptedAt == nil || view.StartResultAt == nil {
+		t.Fatalf("result status=%d view=%+v", result.Code, view)
+	}
+	watch := performUserRequest(t, fixture.server, http.MethodGet, "/v3/cellular-controls/"+controlID, fixture.targetWatch.AccessToken, nil)
+	if watch.Code != http.StatusOK || strings.Contains(watch.Body.String(), phone) || strings.Contains(watch.Body.String(), "tel.380501234567") {
+		t.Fatalf("unsafe Watch view status=%d body=%q", watch.Code, watch.Body.String())
 	}
 }
 

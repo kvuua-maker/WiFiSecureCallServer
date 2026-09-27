@@ -9,20 +9,41 @@ import (
 )
 
 const (
-	DefaultTTL        = 2 * time.Minute
-	terminalRetention = 2 * time.Minute
+	DefaultTTL            = 2 * time.Minute
+	terminalRetention     = 2 * time.Minute
+	SafePublicErrorDomain = "PublicCellularAPI"
 )
 
 type State string
 
 const (
-	DeliveryPending       State = "iphone_delivery_pending"
-	IPhoneActionRequired  State = "iphone_action_required"
-	IPhoneStartAuthorized State = "iphone_start_authorized"
-	IPhoneStartRequested  State = "iphone_start_requested"
-	Cancelled             State = "cancelled"
-	Expired               State = "expired"
-	FailedSafe            State = "failed_safe"
+	DeliveryPending                State = "iphone_delivery_pending"
+	IPhoneActionRequired           State = "iphone_action_required"
+	IPhoneBackgroundReceived       State = "iphone_background_received"
+	IPhoneStartAuthorized          State = "iphone_start_authorized"
+	IPhoneBackgroundStartAttempted State = "iphone_background_start_attempted"
+	IPhoneForegroundStartAttempted State = "iphone_foreground_start_attempted"
+	SystemStartAccepted            State = "system_start_accepted"
+	PublicStartError               State = "public_start_error"
+	Cancelled                      State = "cancelled"
+	Expired                        State = "expired"
+	FailedSafe                     State = "failed_safe"
+)
+
+type ReceiptContext string
+
+const (
+	ReceiptForeground             ReceiptContext = "foreground"
+	ReceiptBackground             ReceiptContext = "background"
+	ReceiptInactive               ReceiptContext = "inactive"
+	ReceiptOpenedFromNotification ReceiptContext = "opened_from_notification"
+)
+
+type StartResult string
+
+const (
+	StartAccepted StartResult = "accepted"
+	StartError    StartResult = "error"
 )
 
 type Participant struct {
@@ -30,16 +51,23 @@ type Participant struct {
 }
 
 type View struct {
-	RequestID           string    `json:"requestID"`
-	State               State     `json:"state"`
-	CreatedAt           time.Time `json:"createdAt"`
-	ExpiresAt           time.Time `json:"expiresAt"`
-	DeliveryStatus      string    `json:"deliveryStatus"`
-	SourcePlatform      string    `json:"sourcePlatform"`
-	TargetPlatform      string    `json:"targetPlatform"`
-	SameOwnerAuthorized bool      `json:"sameOwnerAuthorized"`
-	MutationApplied     *bool     `json:"mutationApplied,omitempty"`
-	TerminalReason      string    `json:"terminalReason,omitempty"`
+	RequestID           string         `json:"requestID"`
+	State               State          `json:"state"`
+	CreatedAt           time.Time      `json:"createdAt"`
+	ExpiresAt           time.Time      `json:"expiresAt"`
+	DeliveryStatus      string         `json:"deliveryStatus"`
+	SourcePlatform      string         `json:"sourcePlatform"`
+	TargetPlatform      string         `json:"targetPlatform"`
+	SameOwnerAuthorized bool           `json:"sameOwnerAuthorized"`
+	MutationApplied     *bool          `json:"mutationApplied,omitempty"`
+	TerminalReason      string         `json:"terminalReason,omitempty"`
+	ReceiptContext      ReceiptContext `json:"receiptContext,omitempty"`
+	ReceivedAt          *time.Time     `json:"receivedAt,omitempty"`
+	StartAttemptedAt    *time.Time     `json:"startAttemptedAt,omitempty"`
+	StartResultAt       *time.Time     `json:"startResultAt,omitempty"`
+	StartResult         StartResult    `json:"startResult,omitempty"`
+	SafeErrorDomain     string         `json:"safeErrorDomain,omitempty"`
+	SafeErrorCode       *int           `json:"safeErrorCode,omitempty"`
 }
 
 type StartGrant struct {
@@ -60,9 +88,16 @@ type control struct {
 	state                               State
 	createdAt, expiresAt                time.Time
 	deliveryStatus, terminalReason      string
+	receiptContext                      ReceiptContext
+	receivedAt, startAttemptedAt        time.Time
+	startResultAt                       time.Time
+	startResult                         StartResult
+	safeErrorDomain                     string
+	safeErrorCode                       *int
 	receiveMutations                    map[string]bool
 	startMutationID                     string
-	startResultMutations                map[string]bool
+	startAttemptMutationID              string
+	startResultMutationID               string
 	cancelMutationID                    string
 	timer                               *time.Timer
 }
@@ -109,7 +144,7 @@ func (s *Store) Create(requestID string, source, target Participant, phoneNumber
 		requestID: requestID, phoneNumber: phoneNumber, phoneDigest: phoneDigest,
 		source: source, target: target, state: DeliveryPending,
 		createdAt: now, expiresAt: now.Add(s.ttl), deliveryStatus: "pending",
-		receiveMutations: map[string]bool{}, startResultMutations: map[string]bool{},
+		receiveMutations: map[string]bool{},
 	}
 	s.controls[requestID] = value
 	value.timer = time.AfterFunc(s.ttl, func() { s.expire(requestID) })
@@ -126,7 +161,7 @@ func (s *Store) Get(requestID string, participant Participant) (View, error) {
 	return viewLocked(value, nil), nil
 }
 
-func (s *Store) Receive(requestID, mutationID string, target Participant) (View, error) {
+func (s *Store) Receive(requestID, mutationID string, target Participant, context ReceiptContext) (View, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	value, err := s.targetLocked(requestID, target)
@@ -134,7 +169,7 @@ func (s *Store) Receive(requestID, mutationID string, target Participant) (View,
 		return View{}, err
 	}
 	mutationID = normalize(mutationID)
-	if mutationID == "" {
+	if mutationID == "" || !ValidReceiptContext(context) {
 		return View{}, failure(400, "invalid_request")
 	}
 	if value.receiveMutations[mutationID] {
@@ -146,7 +181,15 @@ func (s *Store) Receive(requestID, mutationID string, target Participant) (View,
 	if value.state == Cancelled || value.state == FailedSafe {
 		return View{}, failure(409, "request_not_available")
 	}
-	if value.state == DeliveryPending {
+	if value.state != DeliveryPending {
+		value.receiveMutations[mutationID] = true
+		return viewLocked(value, boolPointer(false)), nil
+	}
+	value.receiptContext = context
+	value.receivedAt = s.now().UTC()
+	if context == ReceiptBackground || context == ReceiptInactive {
+		value.state = IPhoneBackgroundReceived
+	} else {
 		value.state = IPhoneActionRequired
 	}
 	value.receiveMutations[mutationID] = true
@@ -173,7 +216,7 @@ func (s *Store) ClaimStart(requestID, mutationID string, target Participant) (St
 	if value.state == Expired {
 		return StartGrant{}, failure(409, "request_expired")
 	}
-	if value.state != IPhoneActionRequired {
+	if value.state != IPhoneActionRequired && value.state != IPhoneBackgroundReceived {
 		return StartGrant{}, failure(409, "request_not_ready")
 	}
 	phoneNumber := value.phoneNumber
@@ -186,7 +229,7 @@ func (s *Store) ClaimStart(requestID, mutationID string, target Participant) (St
 	return StartGrant{View: viewLocked(value, boolPointer(true)), PhoneNumber: phoneNumber}, nil
 }
 
-func (s *Store) MarkStartRequested(requestID, mutationID string, target Participant) (View, error) {
+func (s *Store) MarkStartAttempted(requestID, mutationID string, target Participant) (View, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	value, err := s.targetLocked(requestID, target)
@@ -197,14 +240,63 @@ func (s *Store) MarkStartRequested(requestID, mutationID string, target Particip
 	if mutationID == "" {
 		return View{}, failure(400, "invalid_request")
 	}
-	if value.startResultMutations[mutationID] {
+	if value.startAttemptMutationID == mutationID {
 		return viewLocked(value, boolPointer(false)), nil
 	}
-	if value.state != IPhoneStartAuthorized && value.state != IPhoneStartRequested {
+	if value.startAttemptMutationID != "" {
+		return View{}, failure(409, "system_start_already_attempted")
+	}
+	if value.state != IPhoneStartAuthorized {
 		return View{}, failure(409, "system_start_not_authorized")
 	}
-	value.startResultMutations[mutationID] = true
-	value.state = IPhoneStartRequested
+	value.startAttemptMutationID = mutationID
+	value.startAttemptedAt = s.now().UTC()
+	if value.receiptContext == ReceiptBackground || value.receiptContext == ReceiptInactive {
+		value.state = IPhoneBackgroundStartAttempted
+	} else {
+		value.state = IPhoneForegroundStartAttempted
+	}
+	return viewLocked(value, boolPointer(true)), nil
+}
+
+func (s *Store) MarkStartResult(requestID, mutationID string, target Participant, result StartResult, safeErrorDomain string, safeErrorCode *int) (View, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value, err := s.targetLocked(requestID, target)
+	if err != nil {
+		return View{}, err
+	}
+	mutationID = normalize(mutationID)
+	if mutationID == "" || (result != StartAccepted && result != StartError) {
+		return View{}, failure(400, "invalid_request")
+	}
+	if value.startResultMutationID == mutationID {
+		return viewLocked(value, boolPointer(false)), nil
+	}
+	if value.startResultMutationID != "" {
+		return View{}, failure(409, "system_start_result_already_reported")
+	}
+	if value.state != IPhoneBackgroundStartAttempted && value.state != IPhoneForegroundStartAttempted {
+		return View{}, failure(409, "system_start_not_attempted")
+	}
+	if result == StartError && (!ValidSafeErrorDomain(safeErrorDomain) || safeErrorCode == nil) {
+		return View{}, failure(400, "invalid_request")
+	}
+	if result == StartAccepted && (safeErrorDomain != "" || safeErrorCode != nil) {
+		return View{}, failure(400, "invalid_request")
+	}
+	value.startResultMutationID = mutationID
+	value.startResultAt = s.now().UTC()
+	value.startResult = result
+	if result == StartAccepted {
+		value.state = SystemStartAccepted
+	} else {
+		value.state = PublicStartError
+		value.safeErrorDomain = safeErrorDomain
+		code := *safeErrorCode
+		value.safeErrorCode = &code
+		value.terminalReason = "public_start_error"
+	}
 	s.scheduleCleanupLocked(value, s.now())
 	return viewLocked(value, boolPointer(true)), nil
 }
@@ -223,7 +315,7 @@ func (s *Store) Cancel(requestID, mutationID string, source Participant) (View, 
 	if value.cancelMutationID != "" && value.cancelMutationID == mutationID {
 		return viewLocked(value, boolPointer(false)), nil
 	}
-	if value.state == IPhoneStartAuthorized || value.state == IPhoneStartRequested {
+	if value.state == IPhoneStartAuthorized || value.state == IPhoneBackgroundStartAttempted || value.state == IPhoneForegroundStartAttempted || value.state == SystemStartAccepted || value.state == PublicStartError {
 		return View{}, failure(409, "system_start_already_authorized")
 	}
 	if value.state == Expired {
@@ -248,7 +340,7 @@ func (s *Store) MarkDelivery(requestID string, accepted bool) (View, error) {
 		return View{}, failure(404, "request_not_found")
 	}
 	s.expireLocked(value, s.now())
-	if value.state == Expired || value.state == Cancelled || value.state == IPhoneStartAuthorized || value.state == IPhoneStartRequested {
+	if value.deliveryStatus != "pending" {
 		return viewLocked(value, boolPointer(false)), nil
 	}
 	if accepted {
@@ -321,11 +413,22 @@ func (s *Store) expire(requestID string) {
 }
 
 func (s *Store) expireLocked(value *control, now time.Time) {
-	if now.Before(value.expiresAt) || value.state == Cancelled || value.state == FailedSafe || value.state == IPhoneStartRequested {
+	if now.Before(value.expiresAt) || terminal(value.state) {
 		return
 	}
+	switch value.state {
+	case DeliveryPending:
+		if value.deliveryStatus == "submission_accepted" {
+			value.terminalReason = "background_execution_not_observed"
+		} else {
+			value.terminalReason = "request_expired"
+		}
+	case IPhoneStartAuthorized, IPhoneBackgroundStartAttempted, IPhoneForegroundStartAttempted:
+		value.terminalReason = "public_start_result_not_observed"
+	default:
+		value.terminalReason = "request_expired"
+	}
 	value.state = Expired
-	value.terminalReason = "request_expired"
 	value.phoneNumber = ""
 	s.scheduleCleanupLocked(value, now)
 }
@@ -353,8 +456,50 @@ func viewLocked(value *control, mutationApplied *bool) View {
 		RequestID: value.requestID, State: value.state, CreatedAt: value.createdAt, ExpiresAt: value.expiresAt,
 		DeliveryStatus: value.deliveryStatus, SourcePlatform: value.source.Platform, TargetPlatform: value.target.Platform,
 		SameOwnerAuthorized: value.source.UserID == value.target.UserID, MutationApplied: mutationApplied,
-		TerminalReason: value.terminalReason,
+		TerminalReason: value.terminalReason, ReceiptContext: value.receiptContext,
+		ReceivedAt: timePointer(value.receivedAt), StartAttemptedAt: timePointer(value.startAttemptedAt),
+		StartResultAt: timePointer(value.startResultAt),
+		StartResult:   value.startResult, SafeErrorDomain: value.safeErrorDomain,
+		SafeErrorCode: cloneInt(value.safeErrorCode),
 	}
+}
+
+func ValidReceiptContext(value ReceiptContext) bool {
+	switch value {
+	case ReceiptForeground, ReceiptBackground, ReceiptInactive, ReceiptOpenedFromNotification:
+		return true
+	default:
+		return false
+	}
+}
+
+func ValidSafeErrorDomain(value string) bool {
+	return value == SafePublicErrorDomain
+}
+
+func terminal(state State) bool {
+	switch state {
+	case Cancelled, Expired, FailedSafe, SystemStartAccepted, PublicStartError:
+		return true
+	default:
+		return false
+	}
+}
+
+func cloneInt(value *int) *int {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func timePointer(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
+	}
+	copy := value
+	return &copy
 }
 
 func normalize(value string) string { return strings.ToLower(strings.TrimSpace(value)) }
