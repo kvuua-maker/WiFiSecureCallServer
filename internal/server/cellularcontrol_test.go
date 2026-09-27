@@ -270,11 +270,18 @@ func TestRemoteCellularControlCreateIsIdempotentAndCancelDoesNotTerminateCarrier
 	fixture, fake := prepareRemoteControlFixture(t)
 	controlID := "b1111111-1111-4111-8111-111111111111"
 	body := map[string]string{"requestID": controlID, "phoneNumber": "+380501234567"}
-	for index := 0; index < 2; index++ {
-		response := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls", fixture.targetWatch.AccessToken, body)
-		if response.Code != http.StatusOK {
-			t.Fatalf("create %d status=%d", index, response.Code)
-		}
+	response := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls", fixture.targetWatch.AccessToken, body)
+	if response.Code != http.StatusOK {
+		t.Fatalf("create status=%d", response.Code)
+	}
+	if err := fixture.auth.InvalidateAccountDeviceToken(
+		fixture.targetIOS.Account.AccountID, fixture.targetIOS.DeviceID, "alert", strings.Repeat("c", 64), 1,
+	); err != nil {
+		t.Fatal(err)
+	}
+	retry := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls", fixture.targetWatch.AccessToken, body)
+	if retry.Code != http.StatusOK || decodeCellularControlView(t, retry.Body.Bytes()).RequestID != controlID {
+		t.Fatalf("retry after eligibility changed status=%d body=%q", retry.Code, retry.Body.String())
 	}
 	if got := len(waitForRemotePush(t, fake, 1)); got != 1 {
 		t.Fatalf("push count=%d", got)

@@ -33,8 +33,21 @@ func TestCreateIsSameOwnerWatchToIPhoneAndIdempotent(t *testing.T) {
 	if err != nil || created || duplicate.RequestID != id {
 		t.Fatalf("duplicate view=%+v created=%v err=%v", duplicate, created, err)
 	}
+	changedTarget := target
+	changedTarget.DeviceID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	duplicate, created, err = store.Create(id, source, changedTarget, testPhone)
+	if err != nil || created || duplicate.RequestID != id {
+		t.Fatalf("retargeted retry view=%+v created=%v err=%v", duplicate, created, err)
+	}
+	existing, found, err := store.ExistingCreate(id, source, testPhone)
+	if err != nil || !found || existing.RequestID != id {
+		t.Fatalf("existing retry view=%+v found=%v err=%v", existing, found, err)
+	}
 	if _, _, err = store.Create(id, source, target, "+380671234567"); errorCode(err) != "request_conflict" {
 		t.Fatalf("changed parameters error=%v", err)
+	}
+	if _, found, err = store.ExistingCreate(id, source, "+380671234567"); found || errorCode(err) != "request_conflict" {
+		t.Fatalf("changed retry found=%v error=%v", found, err)
 	}
 	encoded, err := json.Marshal(view)
 	if err != nil {
@@ -307,6 +320,7 @@ func TestUnsubmittedRequestExpiryIsNotReportedAsMissedBackgroundExecution(t *tes
 
 func TestAttemptWithoutPublicResultExpiresDistinctly(t *testing.T) {
 	store := New(20 * time.Millisecond)
+	store.startResultGrace = 20 * time.Millisecond
 	defer store.Close()
 	source, target := participants()
 	id := "55555555-5555-4555-8555-555555555555"
@@ -326,6 +340,34 @@ func TestAttemptWithoutPublicResultExpiresDistinctly(t *testing.T) {
 	view, err := store.Get(id, source)
 	if err != nil || view.State != Expired || view.TerminalReason != "public_start_result_not_observed" {
 		t.Fatalf("expired attempt view=%+v err=%v", view, err)
+	}
+}
+
+func TestClaimNearOriginalExpiryHasBoundedResultReportingGrace(t *testing.T) {
+	store := New(time.Minute)
+	defer store.Close()
+	store.startResultGrace = 30 * time.Second
+	base := time.Now().UTC()
+	now := base
+	store.now = func() time.Time { return now }
+	source, target := participants()
+	id := "55555555-5555-4555-8555-555555555555"
+	if _, _, err := store.Create(id, source, target, testPhone); err != nil {
+		t.Fatal(err)
+	}
+	now = base.Add(time.Minute - time.Millisecond)
+	if _, err := store.Receive(id, "66666666-6666-4666-8666-666666666666", target, ReceiptBackground); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimStart(id, "77777777-7777-4777-8777-777777777777", target); err != nil {
+		t.Fatal(err)
+	}
+	now = base.Add(time.Minute + time.Second)
+	if view, err := store.MarkStartAttempted(id, "88888888-8888-4888-8888-888888888888", target); err != nil || view.State != IPhoneBackgroundStartAttempted {
+		t.Fatalf("attempt after original expiry view=%+v err=%v", view, err)
+	}
+	if view, err := store.MarkStartResult(id, "99999999-9999-4999-8999-999999999999", target, StartAccepted, "", nil); err != nil || view.State != SystemStartAccepted {
+		t.Fatalf("result after original expiry view=%+v err=%v", view, err)
 	}
 }
 
@@ -369,6 +411,10 @@ func TestDeliveryFailureClearsPhoneAndCannotBeClaimed(t *testing.T) {
 	}
 	if _, err := store.ClaimStart(id, "66666666-6666-4666-8666-666666666666", target); errorCode(err) != "request_not_ready" {
 		t.Fatalf("claim after failure err=%v", err)
+	}
+	preserved, err := store.Cancel(id, "77777777-7777-4777-8777-777777777777", source)
+	if err != nil || preserved.State != FailedSafe || preserved.TerminalReason != "iphone_delivery_failed" || preserved.MutationApplied == nil || *preserved.MutationApplied {
+		t.Fatalf("cancel after failure view=%+v err=%v", preserved, err)
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 
 const (
 	DefaultTTL            = 2 * time.Minute
+	startResultGrace      = 30 * time.Second
 	terminalRetention     = 2 * time.Minute
 	SafePublicErrorDomain = "PublicCellularAPI"
 )
@@ -90,6 +91,7 @@ type control struct {
 	deliveryStatus, terminalReason      string
 	receiptContext                      ReceiptContext
 	receivedAt, startAttemptedAt        time.Time
+	startResultDeadline                 time.Time
 	startResultAt                       time.Time
 	startResult                         StartResult
 	safeErrorDomain                     string
@@ -103,18 +105,19 @@ type control struct {
 }
 
 type Store struct {
-	mu       sync.Mutex
-	ttl      time.Duration
-	now      func() time.Time
-	controls map[string]*control
-	closed   bool
+	mu               sync.Mutex
+	ttl              time.Duration
+	startResultGrace time.Duration
+	now              func() time.Time
+	controls         map[string]*control
+	closed           bool
 }
 
 func New(ttl time.Duration) *Store {
 	if ttl <= 0 {
 		ttl = DefaultTTL
 	}
-	return &Store{ttl: ttl, now: time.Now, controls: map[string]*control{}}
+	return &Store{ttl: ttl, startResultGrace: startResultGrace, now: time.Now, controls: map[string]*control{}}
 }
 
 func (s *Store) Create(requestID string, source, target Participant, phoneNumber string) (View, bool, error) {
@@ -133,7 +136,7 @@ func (s *Store) Create(requestID string, source, target Participant, phoneNumber
 	}
 	if existing, ok := s.controls[requestID]; ok {
 		s.expireLocked(existing, s.now())
-		if existing.source != source || existing.target != target || existing.phoneDigest != phoneDigest {
+		if existing.source != source || existing.phoneDigest != phoneDigest {
 			return View{}, false, failure(409, "request_conflict")
 		}
 		return viewLocked(existing, nil), false, nil
@@ -149,6 +152,30 @@ func (s *Store) Create(requestID string, source, target Participant, phoneNumber
 	s.controls[requestID] = value
 	value.timer = time.AfterFunc(s.ttl, func() { s.expire(requestID) })
 	return viewLocked(value, nil), true, nil
+}
+
+// ExistingCreate makes retries independent of mutable device eligibility while
+// preserving the source and destination-number idempotency contract.
+func (s *Store) ExistingCreate(requestID string, source Participant, phoneNumber string) (View, bool, error) {
+	requestID = normalize(requestID)
+	source = normalizeParticipant(source)
+	if requestID == "" || source.UserID == "" || source.AccountID == "" || source.DeviceID == "" || source.Platform != "watchOS" || phoneNumber == "" {
+		return View{}, false, failure(400, "invalid_request")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return View{}, false, failure(503, "control_unavailable")
+	}
+	existing, ok := s.controls[requestID]
+	if !ok {
+		return View{}, false, nil
+	}
+	s.expireLocked(existing, s.now())
+	if existing.source != source || existing.phoneDigest != digest(phoneNumber) {
+		return View{}, false, failure(409, "request_conflict")
+	}
+	return viewLocked(existing, nil), true, nil
 }
 
 func (s *Store) Get(requestID string, participant Participant) (View, error) {
@@ -226,6 +253,11 @@ func (s *Store) ClaimStart(requestID, mutationID string, target Participant) (St
 	value.startMutationID = mutationID
 	value.state = IPhoneStartAuthorized
 	value.phoneNumber = ""
+	now := s.now().UTC()
+	value.startResultDeadline = now.Add(s.startResultGrace)
+	if value.startResultDeadline.After(value.expiresAt) {
+		s.armTimerLocked(value, value.startResultDeadline)
+	}
 	return StartGrant{View: viewLocked(value, boolPointer(true)), PhoneNumber: phoneNumber}, nil
 }
 
@@ -321,6 +353,9 @@ func (s *Store) Cancel(requestID, mutationID string, source Participant) (View, 
 	if value.state == Expired {
 		return View{}, failure(409, "request_expired")
 	}
+	if value.state == FailedSafe {
+		return viewLocked(value, boolPointer(false)), nil
+	}
 	if value.state == Cancelled {
 		return viewLocked(value, boolPointer(false)), nil
 	}
@@ -413,7 +448,11 @@ func (s *Store) expire(requestID string) {
 }
 
 func (s *Store) expireLocked(value *control, now time.Time) {
-	if now.Before(value.expiresAt) || terminal(value.state) {
+	deadline := value.expiresAt
+	if (value.state == IPhoneStartAuthorized || value.state == IPhoneBackgroundStartAttempted || value.state == IPhoneForegroundStartAttempted) && value.startResultDeadline.After(deadline) {
+		deadline = value.startResultDeadline
+	}
+	if now.Before(deadline) || terminal(value.state) {
 		return
 	}
 	switch value.state {
@@ -431,6 +470,14 @@ func (s *Store) expireLocked(value *control, now time.Time) {
 	value.state = Expired
 	value.phoneNumber = ""
 	s.scheduleCleanupLocked(value, now)
+}
+
+func (s *Store) armTimerLocked(value *control, deadline time.Time) {
+	if value.timer != nil {
+		value.timer.Stop()
+	}
+	requestID := value.requestID
+	value.timer = time.AfterFunc(time.Until(deadline), func() { s.expire(requestID) })
 }
 
 func (s *Store) scheduleCleanupLocked(value *control, now time.Time) {

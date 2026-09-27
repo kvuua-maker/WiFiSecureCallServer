@@ -51,6 +51,13 @@ func (s *Server) createCellularControl(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "same_owner_required")
 		return
 	}
+	if existing, found, err := s.cellularControls.ExistingCreate(body.RequestID, source, body.PhoneNumber); err != nil {
+		writeCellularControlError(w, err)
+		return
+	} else if found {
+		writeJSON(w, http.StatusOK, existing)
+		return
+	}
 	targetDevice, ok := selectRemoteCellularIPhone(identity, s.phoneAuth.DevicesForUser(identity.UserID))
 	if !ok {
 		writeError(w, http.StatusConflict, "iphone_unavailable")
