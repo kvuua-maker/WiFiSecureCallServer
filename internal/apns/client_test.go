@@ -223,3 +223,45 @@ func TestRemoteCellularControlUsesBackgroundDeliveryAndOpaqueIdentifiersOnly(t *
 		}
 	}
 }
+
+func TestRemoteCellularNotificationActionUsesVisibleIPhoneAlertAndOpaqueIdentifiersOnly(t *testing.T) {
+	var captured capturedAPNSRequest
+	client := testClient(t, &captured)
+	requestID := "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	accountID := "11111111-2222-4333-8444-555555555555"
+	expiresAt := time.Unix(1_800_000_120, 987_654_321)
+	if _, err := client.RemoteCellularNotificationAction(context.Background(), "0123456789abcdef", requestID, expiresAt, accountID); err != nil {
+		t.Fatal(err)
+	}
+	if captured.header.Get("apns-topic") != "com.vkapps.wifisecurecall" || captured.header.Get("apns-push-type") != "alert" || captured.header.Get("apns-priority") != "10" {
+		t.Fatalf("headers=%v", captured.header)
+	}
+	if got := captured.header.Get("apns-expiration"); got != "1800000120" {
+		t.Fatalf("expiration=%q", got)
+	}
+	if captured.payload["event"] != "remote_cellular_notification_action" || captured.payload["requestID"] != requestID || captured.payload["accountID"] != accountID {
+		t.Fatalf("payload=%#v", captured.payload)
+	}
+	aps, ok := captured.payload["aps"].(map[string]any)
+	if !ok || len(aps) != 2 || aps["category"] != "REMOTE_CELLULAR_NOTIFICATION_ACTION" {
+		t.Fatalf("aps=%#v", captured.payload["aps"])
+	}
+	alert, ok := aps["alert"].(map[string]any)
+	if !ok || alert["title"] != "Запит дзвінка" || alert["body"] != "Натисніть, щоб попросити iPhone почати мобільний виклик" {
+		t.Fatalf("alert=%#v", aps["alert"])
+	}
+	for _, forbidden := range []string{"content-available", "sound", "badge", "interruption-level"} {
+		if _, exists := aps[forbidden]; exists {
+			t.Fatalf("notification-action aps contains %q: %#v", forbidden, aps)
+		}
+	}
+	encoded, err := json.Marshal(captured.payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"+380501234567", "phoneNumber", "phoneHash", "callerLabel", "mediaToken", "accessToken", "refreshToken"} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("payload exposed %q: %s", forbidden, encoded)
+		}
+	}
+}

@@ -12,12 +12,12 @@ const testPhone = "+380501234567"
 
 func participants() (Participant, Participant) {
 	return Participant{
-		UserID: "11111111-1111-4111-8111-111111111111", AccountID: "22222222-2222-4222-8222-222222222222",
-		DeviceID: "33333333-3333-4333-8333-333333333333", Platform: "watchOS",
-	}, Participant{
-		UserID: "11111111-1111-4111-8111-111111111111", AccountID: "22222222-2222-4222-8222-222222222222",
-		DeviceID: "44444444-4444-4444-8444-444444444444", Platform: "iOS",
-	}
+			UserID: "11111111-1111-4111-8111-111111111111", AccountID: "22222222-2222-4222-8222-222222222222",
+			DeviceID: "33333333-3333-4333-8333-333333333333", Platform: "watchOS",
+		}, Participant{
+			UserID: "11111111-1111-4111-8111-111111111111", AccountID: "22222222-2222-4222-8222-222222222222",
+			DeviceID: "44444444-4444-4444-8444-444444444444", Platform: "iOS",
+		}
 }
 
 func TestCreateIsSameOwnerWatchToIPhoneAndIdempotent(t *testing.T) {
@@ -228,6 +228,124 @@ func TestReceiptContextIsFirstObservedAndValidated(t *testing.T) {
 	second, err := store.Receive(id, "88888888-8888-4888-8888-888888888888", target, ReceiptForeground)
 	if err != nil || second.ReceiptContext != ReceiptBackground || second.MutationApplied == nil || *second.MutationApplied {
 		t.Fatalf("second=%+v err=%v", second, err)
+	}
+}
+
+func TestNotificationActionReceiptDoesNotGetConsumedOrDowngradedByOrdinaryReceipt(t *testing.T) {
+	store := New(time.Minute)
+	defer store.Close()
+	source, target := participants()
+	id := "55555555-5555-4555-8555-555555555555"
+	if view, _, err := store.CreateWithMode(id, source, target, testPhone, NotificationAction); err != nil || view.DeliveryMode != NotificationAction {
+		t.Fatalf("create view=%+v err=%v", view, err)
+	}
+	ordinary, err := store.ReceiveWithApplicationState(
+		id, "66666666-6666-4666-8666-666666666666", target, ReceiptBackground, ApplicationBackground,
+	)
+	if err != nil || ordinary.State != DeliveryPending || ordinary.OrdinaryReceivedAt == nil || ordinary.NotificationActionReceivedAt != nil {
+		t.Fatalf("ordinary=%+v err=%v", ordinary, err)
+	}
+	if _, err := store.ClaimStart(id, "77777777-7777-4777-8777-777777777777", target); errorCode(err) != "request_not_ready" {
+		t.Fatalf("ordinary receipt authorized start: %v", err)
+	}
+	action, err := store.ReceiveWithApplicationState(
+		id, "88888888-8888-4888-8888-888888888888", target, ReceiptNotificationAction, ApplicationBackground,
+	)
+	if err != nil || action.State != IPhoneNotificationActionReceived || action.ReceiptContext != ReceiptNotificationAction || action.ApplicationState != ApplicationBackground || action.NotificationActionReceivedAt == nil {
+		t.Fatalf("action=%+v err=%v", action, err)
+	}
+	actionAt := *action.NotificationActionReceivedAt
+	late, err := store.ReceiveWithApplicationState(
+		id, "99999999-9999-4999-8999-999999999999", target, ReceiptForeground, ApplicationForeground,
+	)
+	if err != nil || late.State != IPhoneNotificationActionReceived || late.ReceiptContext != ReceiptNotificationAction || late.ApplicationState != ApplicationBackground || late.NotificationActionReceivedAt == nil || !late.NotificationActionReceivedAt.Equal(actionAt) {
+		t.Fatalf("late ordinary downgraded action=%+v err=%v", late, err)
+	}
+	relaunchedAction, err := store.ReceiveWithApplicationState(
+		id, "abababab-abab-4bab-8bab-abababababab", target, ReceiptNotificationAction, ApplicationForeground,
+	)
+	if err != nil || relaunchedAction.State != IPhoneNotificationActionReceived || relaunchedAction.ReceiptContext != ReceiptNotificationAction || relaunchedAction.ApplicationState != ApplicationBackground || relaunchedAction.MutationApplied == nil || *relaunchedAction.MutationApplied {
+		t.Fatalf("relaunch action changed established provenance: view=%+v err=%v", relaunchedAction, err)
+	}
+	grant, err := store.ClaimStart(id, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", target)
+	if err != nil || grant.PhoneNumber != testPhone || grant.DeliveryMode != NotificationAction {
+		t.Fatalf("grant=%+v err=%v", grant, err)
+	}
+	attempted, err := store.MarkStartAttempted(id, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", target)
+	if err != nil || attempted.State != IPhoneNotificationActionStartAttempted {
+		t.Fatalf("attempted=%+v err=%v", attempted, err)
+	}
+}
+
+func TestNotificationActionReceiptMutationIsContextBoundAndIdempotent(t *testing.T) {
+	store := New(time.Minute)
+	defer store.Close()
+	source, target := participants()
+	id := "55555555-5555-4555-8555-555555555555"
+	mutation := "66666666-6666-4666-8666-666666666666"
+	if _, _, err := store.CreateWithMode(id, source, target, testPhone, NotificationAction); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.ReceiveWithApplicationState(id, mutation, target, ReceiptNotificationAction, ApplicationInactive)
+	if err != nil || first.MutationApplied == nil || !*first.MutationApplied {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	duplicate, err := store.ReceiveWithApplicationState(id, mutation, target, ReceiptNotificationAction, ApplicationInactive)
+	if err != nil || duplicate.MutationApplied == nil || *duplicate.MutationApplied {
+		t.Fatalf("duplicate=%+v err=%v", duplicate, err)
+	}
+	if _, err := store.ReceiveWithApplicationState(id, mutation, target, ReceiptBackground, ApplicationBackground); errorCode(err) != "receipt_mutation_conflict" {
+		t.Fatalf("context conflict err=%v", err)
+	}
+	applicationStateDuplicate, err := store.ReceiveWithApplicationState(id, mutation, target, ReceiptNotificationAction, ApplicationForeground)
+	if err != nil || applicationStateDuplicate.MutationApplied == nil || *applicationStateDuplicate.MutationApplied || applicationStateDuplicate.ApplicationState != ApplicationInactive {
+		t.Fatalf("duplicate action changed first observed application state: view=%+v err=%v", applicationStateDuplicate, err)
+	}
+}
+
+func TestNotificationActionModeIsCreateIdempotencyAndExpiryReason(t *testing.T) {
+	store := New(20 * time.Millisecond)
+	defer store.Close()
+	source, target := participants()
+	id := "55555555-5555-4555-8555-555555555555"
+	if _, _, err := store.CreateWithMode(id, source, target, testPhone, NotificationAction); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.ExistingCreateWithMode(id, source, testPhone, SilentBackground); errorCode(err) != "request_conflict" {
+		t.Fatalf("cross-mode retry err=%v", err)
+	}
+	if _, err := store.MarkDelivery(id, true); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(80 * time.Millisecond)
+	view, err := store.Get(id, source)
+	if err != nil || view.State != Expired || view.TerminalReason != "notification_action_not_observed" {
+		t.Fatalf("expired=%+v err=%v", view, err)
+	}
+}
+
+func TestNotificationActionAfterClaimCannotAuthorizeSecondStart(t *testing.T) {
+	store := New(time.Minute)
+	defer store.Close()
+	source, target := participants()
+	id := "55555555-5555-4555-8555-555555555555"
+	if _, _, err := store.CreateWithMode(id, source, target, testPhone, NotificationAction); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ReceiveWithApplicationState(id, "66666666-6666-4666-8666-666666666666", target, ReceiptNotificationAction, ApplicationBackground); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.ClaimStart(id, "77777777-7777-4777-8777-777777777777", target)
+	if err != nil || first.PhoneNumber != testPhone {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	late, err := store.ReceiveWithApplicationState(id, "88888888-8888-4888-8888-888888888888", target, ReceiptNotificationAction, ApplicationForeground)
+	if err != nil || late.State != IPhoneStartAuthorized || late.MutationApplied == nil || *late.MutationApplied {
+		t.Fatalf("late action=%+v err=%v", late, err)
+	}
+	duplicate, err := store.ClaimStart(id, "99999999-9999-4999-8999-999999999999", target)
+	if errorCode(err) != "system_start_already_authorized" || duplicate.PhoneNumber != "" {
+		t.Fatalf("duplicate=%+v err=%v", duplicate, err)
 	}
 }
 

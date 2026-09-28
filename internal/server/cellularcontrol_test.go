@@ -45,6 +45,7 @@ type remoteControlPushFake struct {
 type remoteControlPush struct {
 	requestID, accountID string
 	expiresAt            time.Time
+	deliveryMode         cellularcontrol.DeliveryMode
 }
 
 func (f *remoteControlPushFake) Configured() bool { return true }
@@ -54,7 +55,17 @@ func (f *remoteControlPushFake) IncomingCall(context.Context, string, string, st
 func (f *remoteControlPushFake) RemoteCellularControl(_ context.Context, _ string, requestID string, expiresAt time.Time, accountID string) (apns.Result, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.requests = append(f.requests, remoteControlPush{requestID: requestID, accountID: accountID, expiresAt: expiresAt})
+	f.requests = append(f.requests, remoteControlPush{requestID: requestID, accountID: accountID, expiresAt: expiresAt, deliveryMode: cellularcontrol.SilentBackground})
+	result := f.result
+	if result.Status == 0 {
+		result.Status = http.StatusOK
+	}
+	return result, f.err
+}
+func (f *remoteControlPushFake) RemoteCellularNotificationAction(_ context.Context, _ string, requestID string, expiresAt time.Time, accountID string) (apns.Result, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.requests = append(f.requests, remoteControlPush{requestID: requestID, accountID: accountID, expiresAt: expiresAt, deliveryMode: cellularcontrol.NotificationAction})
 	result := f.result
 	if result.Status == 0 {
 		result.Status = http.StatusOK
@@ -141,6 +152,13 @@ func TestRemoteCellularTargetSelectionRequiresReadyIPhoneAndPrefersSameAccount(t
 	if !ok || selected.DeviceID != visibleNotificationsDenied.DeviceID {
 		t.Fatalf("silent-push target with visible notifications denied was rejected: selected=%+v ok=%v", selected, ok)
 	}
+	if _, ok := selectRemoteCellularNotificationActionIPhone(source, []accounts.Device{visibleNotificationsDenied}); ok {
+		t.Fatal("notification-action target without visible authorization was selected")
+	}
+	selected, ok = selectRemoteCellularNotificationActionIPhone(source, []accounts.Device{sameAccount})
+	if !ok || selected.DeviceID != sameAccount.DeviceID {
+		t.Fatalf("authorized notification-action target rejected: selected=%+v ok=%v", selected, ok)
+	}
 
 	invalidTargets := []struct {
 		name   string
@@ -158,7 +176,87 @@ func TestRemoteCellularTargetSelectionRequiresReadyIPhoneAndPrefersSameAccount(t
 			if selected, ok := selectRemoteCellularIPhone(source, []accounts.Device{value}); ok {
 				t.Fatalf("invalid target selected: %+v", selected)
 			}
+			if selected, ok := selectRemoteCellularNotificationActionIPhone(source, []accounts.Device{value}); ok {
+				t.Fatalf("invalid notification-action target selected: %+v", selected)
+			}
 		})
+	}
+}
+
+func TestNotificationActionRouteIsOptInIdempotentAndDoesNotChangeLegacyDelivery(t *testing.T) {
+	fixture, fake := prepareRemoteControlFixture(t)
+	phone := "+380501234567"
+	legacyID := "b1234567-1111-4111-8111-111111111111"
+	actionID := "b1234567-2222-4222-8222-222222222222"
+
+	legacy := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls", fixture.targetWatch.AccessToken, map[string]string{"requestID": legacyID, "phoneNumber": phone})
+	if legacy.Code != http.StatusOK || decodeCellularControlView(t, legacy.Body.Bytes()).DeliveryMode != cellularcontrol.SilentBackground {
+		t.Fatalf("legacy status=%d body=%q", legacy.Code, legacy.Body.String())
+	}
+	action := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/notification-action", fixture.targetWatch.AccessToken, map[string]string{"requestID": actionID, "phoneNumber": phone})
+	actionView := decodeCellularControlView(t, action.Body.Bytes())
+	if action.Code != http.StatusOK || actionView.DeliveryMode != cellularcontrol.NotificationAction {
+		t.Fatalf("action status=%d body=%q", action.Code, action.Body.String())
+	}
+	pushes := waitForRemotePush(t, fake, 2)
+	modes := map[string]cellularcontrol.DeliveryMode{}
+	for _, push := range pushes {
+		modes[push.requestID] = push.deliveryMode
+	}
+	if modes[legacyID] != cellularcontrol.SilentBackground || modes[actionID] != cellularcontrol.NotificationAction {
+		t.Fatalf("delivery modes=%v", modes)
+	}
+
+	identity, err := fixture.auth.Authenticate(fixture.targetIOS.AccessToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.auth.RegisterDevice(identity, phoneauth.DeviceRegistration{
+		RequestID: "a1234567-2222-4222-8222-222222222222", DeviceID: fixture.targetIOS.DeviceID,
+		Platform: "iOS", PushType: "alert", Token: strings.Repeat("c", 64), InstallationGeneration: 2,
+		Environment: "production", Capabilities: accounts.DeviceCapabilities{AlertPush: true, NotificationsAuthorized: false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	retry := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/notification-action", fixture.targetWatch.AccessToken, map[string]string{"requestID": actionID, "phoneNumber": phone})
+	retryView := decodeCellularControlView(t, retry.Body.Bytes())
+	if retry.Code != http.StatusOK || !retryView.CreatedAt.Equal(actionView.CreatedAt) || !retryView.ExpiresAt.Equal(actionView.ExpiresAt) {
+		t.Fatalf("retry status=%d body=%q", retry.Code, retry.Body.String())
+	}
+	time.Sleep(25 * time.Millisecond)
+	if got := len(fake.snapshot()); got != 2 {
+		t.Fatalf("retry sent another alert: pushes=%d", got)
+	}
+	crossMode := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls", fixture.targetWatch.AccessToken, map[string]string{"requestID": actionID, "phoneNumber": phone})
+	if crossMode.Code != http.StatusConflict || !strings.Contains(crossMode.Body.String(), "request_conflict") {
+		t.Fatalf("cross-mode status=%d body=%q", crossMode.Code, crossMode.Body.String())
+	}
+}
+
+func TestNotificationActionRouteRequiresVisibleAuthorizationAndSameOwnerTarget(t *testing.T) {
+	fixture, fake := prepareRemoteControlFixture(t)
+	identity, err := fixture.auth.Authenticate(fixture.targetIOS.AccessToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.auth.RegisterDevice(identity, phoneauth.DeviceRegistration{
+		RequestID: "a1234567-3333-4333-8333-333333333333", DeviceID: fixture.targetIOS.DeviceID,
+		Platform: "iOS", PushType: "alert", Token: strings.Repeat("c", 64), InstallationGeneration: 2,
+		Environment: "production", Capabilities: accounts.DeviceCapabilities{AlertPush: true, NotificationsAuthorized: false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	action := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/notification-action", fixture.targetWatch.AccessToken, map[string]string{"requestID": "b1234567-3333-4333-8333-333333333333", "phoneNumber": "+380501234567"})
+	if action.Code != http.StatusConflict || !strings.Contains(action.Body.String(), "iphone_unavailable") {
+		t.Fatalf("action status=%d body=%q", action.Code, action.Body.String())
+	}
+	legacy := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls", fixture.targetWatch.AccessToken, map[string]string{"requestID": "b1234567-4444-4444-8444-444444444444", "phoneNumber": "+380501234567"})
+	if legacy.Code != http.StatusOK {
+		t.Fatalf("silent route regressed status=%d body=%q", legacy.Code, legacy.Body.String())
+	}
+	pushes := waitForRemotePush(t, fake, 1)
+	if pushes[0].deliveryMode != cellularcontrol.SilentBackground {
+		t.Fatalf("unexpected delivery=%s", pushes[0].deliveryMode)
 	}
 }
 
@@ -171,7 +269,7 @@ func TestRemoteCellularControlNeverSelectsAnotherUsersIPhone(t *testing.T) {
 	if err := fixture.auth.RegisterDevice(unrelatedIdentity, phoneauth.DeviceRegistration{
 		RequestID: "a2222222-2222-4222-8222-222222222222", DeviceID: fixture.unrelated.DeviceID,
 		Platform: "iOS", PushType: "alert", Token: strings.Repeat("d", 64), InstallationGeneration: 1,
-		Environment: "production", Capabilities: accounts.DeviceCapabilities{AlertPush: true, NotificationsAuthorized: false, MicrophoneReady: true},
+		Environment: "production", Capabilities: accounts.DeviceCapabilities{AlertPush: true, NotificationsAuthorized: true, MicrophoneReady: true},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -189,6 +287,83 @@ func TestRemoteCellularControlNeverSelectsAnotherUsersIPhone(t *testing.T) {
 	}
 	if got := len(fake.snapshot()); got != 0 {
 		t.Fatalf("unexpected push to another user's device: %d", got)
+	}
+	actionResponse := performUserRequest(
+		t, fixture.server, http.MethodPost, "/v3/cellular-controls/notification-action", fixture.targetWatch.AccessToken,
+		map[string]string{"requestID": "b8888888-8888-4888-8888-888888888888", "phoneNumber": "+380501234567"},
+	)
+	if actionResponse.Code != http.StatusConflict || !strings.Contains(actionResponse.Body.String(), "iphone_unavailable") {
+		t.Fatalf("action status=%d body=%q", actionResponse.Code, actionResponse.Body.String())
+	}
+	if got := len(fake.snapshot()); got != 0 {
+		t.Fatalf("unexpected notification-action push to another user's device: %d", got)
+	}
+}
+
+func TestNotificationActionLifecycleRequiresExactActionReceiptBeforeOneTimeStart(t *testing.T) {
+	fixture, fake := prepareRemoteControlFixture(t)
+	controlID := "b7777777-7777-4777-8777-777777777777"
+	phone := "+380501234567"
+	created := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/notification-action", fixture.targetWatch.AccessToken, map[string]string{"requestID": controlID, "phoneNumber": phone})
+	if created.Code != http.StatusOK {
+		t.Fatalf("create status=%d body=%q", created.Code, created.Body.String())
+	}
+	if pushes := waitForRemotePush(t, fake, 1); len(pushes) != 1 || pushes[0].deliveryMode != cellularcontrol.NotificationAction {
+		t.Fatalf("pushes=%+v", pushes)
+	}
+
+	ordinaryMutation := "c7777777-7777-4777-8777-777777777777"
+	ordinary := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/receive", fixture.targetIOS.AccessToken, map[string]string{
+		"requestID": ordinaryMutation, "receiptContext": "background", "applicationState": "background",
+	})
+	ordinaryView := decodeCellularControlView(t, ordinary.Body.Bytes())
+	if ordinary.Code != http.StatusOK || ordinaryView.State != cellularcontrol.DeliveryPending || ordinaryView.OrdinaryReceivedAt == nil || ordinaryView.NotificationActionReceivedAt != nil {
+		t.Fatalf("ordinary status=%d view=%+v", ordinary.Code, ordinaryView)
+	}
+	blocked := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/start", fixture.targetIOS.AccessToken, map[string]string{"requestID": "d7777777-7777-4777-8777-777777777777"})
+	if blocked.Code != http.StatusConflict || !strings.Contains(blocked.Body.String(), "request_not_ready") {
+		t.Fatalf("ordinary receipt authorized start status=%d body=%q", blocked.Code, blocked.Body.String())
+	}
+
+	actionMutation := "e7777777-7777-4777-8777-777777777777"
+	action := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/receive", fixture.targetIOS.AccessToken, map[string]string{
+		"requestID": actionMutation, "receiptContext": "notification_action", "applicationState": "inactive",
+	})
+	actionView := decodeCellularControlView(t, action.Body.Bytes())
+	if action.Code != http.StatusOK || actionView.State != cellularcontrol.IPhoneNotificationActionReceived || actionView.ReceiptContext != cellularcontrol.ReceiptNotificationAction || actionView.ApplicationState != cellularcontrol.ApplicationInactive || actionView.NotificationActionReceivedAt == nil {
+		t.Fatalf("action status=%d view=%+v", action.Code, actionView)
+	}
+	duplicate := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/receive", fixture.targetIOS.AccessToken, map[string]string{
+		"requestID": actionMutation, "receiptContext": "notification_action", "applicationState": "inactive",
+	})
+	duplicateView := decodeCellularControlView(t, duplicate.Body.Bytes())
+	if duplicate.Code != http.StatusOK || duplicateView.MutationApplied == nil || *duplicateView.MutationApplied {
+		t.Fatalf("duplicate status=%d view=%+v", duplicate.Code, duplicateView)
+	}
+	conflict := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/receive", fixture.targetIOS.AccessToken, map[string]string{
+		"requestID": actionMutation, "receiptContext": "foreground", "applicationState": "foreground",
+	})
+	if conflict.Code != http.StatusConflict || !strings.Contains(conflict.Body.String(), "receipt_mutation_conflict") {
+		t.Fatalf("conflict status=%d body=%q", conflict.Code, conflict.Body.String())
+	}
+
+	claimMutation := "f7777777-7777-4777-8777-777777777777"
+	claimed := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/start", fixture.targetIOS.AccessToken, map[string]string{"requestID": claimMutation})
+	var grant cellularcontrol.StartGrant
+	if claimed.Code != http.StatusOK || json.Unmarshal(claimed.Body.Bytes(), &grant) != nil || grant.PhoneNumber != phone || grant.DeliveryMode != cellularcontrol.NotificationAction {
+		t.Fatalf("claim status=%d grant=%+v", claimed.Code, grant)
+	}
+	secondClaim := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/start", fixture.targetIOS.AccessToken, map[string]string{"requestID": "a7777777-7777-4777-8777-777777777777"})
+	if secondClaim.Code != http.StatusConflict || strings.Contains(secondClaim.Body.String(), phone) {
+		t.Fatalf("second claim status=%d body=%q", secondClaim.Code, secondClaim.Body.String())
+	}
+	attempted := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/start-attempted", fixture.targetIOS.AccessToken, map[string]string{"requestID": "17777777-7777-4777-8777-777777777777"})
+	if attempted.Code != http.StatusOK || decodeCellularControlView(t, attempted.Body.Bytes()).State != cellularcontrol.IPhoneNotificationActionStartAttempted {
+		t.Fatalf("attempted status=%d body=%q", attempted.Code, attempted.Body.String())
+	}
+	accepted := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/start-result", fixture.targetIOS.AccessToken, map[string]any{"requestID": "27777777-7777-4777-8777-777777777777", "result": "accepted"})
+	if accepted.Code != http.StatusOK || decodeCellularControlView(t, accepted.Body.Bytes()).State != cellularcontrol.SystemStartAccepted || strings.Contains(accepted.Body.String(), phone) {
+		t.Fatalf("accepted status=%d body=%q", accepted.Code, accepted.Body.String())
 	}
 }
 
@@ -356,7 +531,7 @@ func TestRemoteCellularControlCreationCriticalSectionCoversCheckSelectionAndCrea
 	if err != nil {
 		t.Fatal(err)
 	}
-	start := bytes.Index(source, []byte("func (s *Server) createCellularControl"))
+	start := bytes.Index(source, []byte("func (s *Server) createCellularControlWithMode"))
 	if start < 0 {
 		t.Fatal("create handler not found")
 	}
@@ -368,9 +543,9 @@ func TestRemoteCellularControlCreationCriticalSectionCoversCheckSelectionAndCrea
 	body := source[start : start+endOffset]
 	lock := bytes.Index(body, []byte("s.cellularControlCreationMu.Lock()"))
 	deferredUnlock := bytes.Index(body, []byte("defer s.cellularControlCreationMu.Unlock()"))
-	existing := bytes.Index(body, []byte("s.cellularControls.ExistingCreate("))
-	selection := bytes.Index(body, []byte("selectRemoteCellularIPhone("))
-	create := bytes.Index(body, []byte("s.cellularControls.Create("))
+	existing := bytes.Index(body, []byte("s.cellularControls.ExistingCreateWithMode("))
+	selection := bytes.Index(body, []byte("selectRemoteCellular"))
+	create := bytes.Index(body, []byte("s.cellularControls.CreateWithMode("))
 	if !(lock >= 0 && lock < deferredUnlock && deferredUnlock < existing && existing < selection && selection < create) {
 		t.Fatalf("creation critical-section order lock=%d defer=%d existing=%d selection=%d create=%d", lock, deferredUnlock, existing, selection, create)
 	}

@@ -21,6 +21,7 @@ func (s *Server) registerV3() {
 	s.mux.HandleFunc("GET /v3/calls/{id}", s.v2Auth(s.getUserCall))
 	s.mux.HandleFunc("POST /v3/calls/{id}/{action}", s.v2Auth(s.mutateUserCall))
 	s.mux.HandleFunc("POST /v3/cellular-controls", s.v2Auth(s.createCellularControl))
+	s.mux.HandleFunc("POST /v3/cellular-controls/notification-action", s.v2Auth(s.createNotificationActionCellularControl))
 	s.mux.HandleFunc("GET /v3/cellular-controls/{id}", s.v2Auth(s.getCellularControl))
 	s.mux.HandleFunc("POST /v3/cellular-controls/{id}/{action}", s.v2Auth(s.mutateCellularControl))
 }

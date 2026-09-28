@@ -24,8 +24,9 @@ type cellularControlMutationRequest struct {
 }
 
 type cellularControlReceiveRequest struct {
-	RequestID      string
-	ReceiptContext cellularcontrol.ReceiptContext
+	RequestID        string
+	ReceiptContext   cellularcontrol.ReceiptContext
+	ApplicationState cellularcontrol.ApplicationState
 }
 
 type cellularControlStartResultRequest struct {
@@ -36,6 +37,14 @@ type cellularControlStartResultRequest struct {
 }
 
 func (s *Server) createCellularControl(w http.ResponseWriter, r *http.Request) {
+	s.createCellularControlWithMode(w, r, cellularcontrol.SilentBackground)
+}
+
+func (s *Server) createNotificationActionCellularControl(w http.ResponseWriter, r *http.Request) {
+	s.createCellularControlWithMode(w, r, cellularcontrol.NotificationAction)
+}
+
+func (s *Server) createCellularControlWithMode(w http.ResponseWriter, r *http.Request, mode cellularcontrol.DeliveryMode) {
 	if s.cellularControls == nil {
 		writeError(w, http.StatusServiceUnavailable, "control_unavailable")
 		return
@@ -53,20 +62,26 @@ func (s *Server) createCellularControl(w http.ResponseWriter, r *http.Request) {
 	}
 	s.cellularControlCreationMu.Lock()
 	defer s.cellularControlCreationMu.Unlock()
-	if existing, found, err := s.cellularControls.ExistingCreate(body.RequestID, source, body.PhoneNumber); err != nil {
+	if existing, found, err := s.cellularControls.ExistingCreateWithMode(body.RequestID, source, body.PhoneNumber, mode); err != nil {
 		writeCellularControlError(w, err)
 		return
 	} else if found {
 		writeJSON(w, http.StatusOK, existing)
 		return
 	}
-	targetDevice, ok := selectRemoteCellularIPhone(identity, s.phoneAuth.DevicesForUser(identity.UserID))
+	devices := s.phoneAuth.DevicesForUser(identity.UserID)
+	var targetDevice accounts.Device
+	if mode == cellularcontrol.NotificationAction {
+		targetDevice, ok = selectRemoteCellularNotificationActionIPhone(identity, devices)
+	} else {
+		targetDevice, ok = selectRemoteCellularIPhone(identity, devices)
+	}
 	if !ok {
 		writeError(w, http.StatusConflict, "iphone_unavailable")
 		return
 	}
 	target := cellularcontrol.Participant{UserID: identity.UserID, AccountID: targetDevice.AccountID, DeviceID: targetDevice.DeviceID, Platform: targetDevice.Platform}
-	view, created, err := s.cellularControls.Create(body.RequestID, source, target, body.PhoneNumber)
+	view, created, err := s.cellularControls.CreateWithMode(body.RequestID, source, target, body.PhoneNumber, mode)
 	if err != nil {
 		writeCellularControlError(w, err)
 		return
@@ -105,7 +120,20 @@ func (s *Server) mutateCellularControl(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid_request")
 			return
 		}
-		view, err := s.cellularControls.Receive(id, body.RequestID, participant, body.ReceiptContext)
+		applicationState := body.ApplicationState
+		if applicationState == "" {
+			switch body.ReceiptContext {
+			case cellularcontrol.ReceiptForeground:
+				applicationState = cellularcontrol.ApplicationForeground
+			case cellularcontrol.ReceiptBackground:
+				applicationState = cellularcontrol.ApplicationBackground
+			case cellularcontrol.ReceiptInactive:
+				applicationState = cellularcontrol.ApplicationInactive
+			default:
+				applicationState = cellularcontrol.ApplicationUnknown
+			}
+		}
+		view, err := s.cellularControls.ReceiveWithApplicationState(id, body.RequestID, participant, body.ReceiptContext, applicationState)
 		if err != nil {
 			writeCellularControlError(w, err)
 			return
@@ -191,11 +219,19 @@ func cellularControlParticipant(identity phoneauth.Identity) cellularcontrol.Par
 }
 
 func selectRemoteCellularIPhone(source phoneauth.Identity, devices []accounts.Device) (accounts.Device, bool) {
+	return selectRemoteCellularIPhoneForDelivery(source, devices, false)
+}
+
+func selectRemoteCellularNotificationActionIPhone(source phoneauth.Identity, devices []accounts.Device) (accounts.Device, bool) {
+	return selectRemoteCellularIPhoneForDelivery(source, devices, true)
+}
+
+func selectRemoteCellularIPhoneForDelivery(source phoneauth.Identity, devices []accounts.Device, requiresVisibleAuthorization bool) (accounts.Device, bool) {
 	candidates := make([]accounts.Device, 0)
 	for _, device := range devices {
-		// Remote cellular control uses a silent background notification. Visible
-		// alert authorization is not required for that APNs delivery class.
-		if device.Platform != "iOS" || device.Environment != "production" || device.AlertToken == "" || !device.Capabilities.AlertPush {
+		// Silent delivery does not require visible-alert authorization. The
+		// notification-action probe does because it sends an actual alert.
+		if device.Platform != "iOS" || device.Environment != "production" || device.AlertToken == "" || !device.Capabilities.AlertPush || (requiresVisibleAuthorization && !device.Capabilities.NotificationsAuthorized) {
 			continue
 		}
 		candidates = append(candidates, device)
@@ -221,18 +257,29 @@ func selectRemoteCellularIPhone(source phoneauth.Identity, devices []accounts.De
 }
 
 func (s *Server) deliverRemoteCellularControl(view cellularcontrol.View, target accounts.Device) {
-	sender, ok := s.apns.(apns.RemoteCellularControlSender)
-	if !ok {
-		_, _ = s.cellularControls.MarkDelivery(view.RequestID, false)
-		return
-	}
 	deadline := view.ExpiresAt
 	if deadline.After(time.Now().Add(8 * time.Second)) {
 		deadline = time.Now().Add(8 * time.Second)
 	}
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
-	result, err := sender.RemoteCellularControl(ctx, target.AlertToken, view.RequestID, view.ExpiresAt, target.AccountID)
+	var result apns.Result
+	var err error
+	if view.DeliveryMode == cellularcontrol.NotificationAction {
+		sender, ok := s.apns.(apns.RemoteCellularNotificationActionSender)
+		if !ok {
+			_, _ = s.cellularControls.MarkDelivery(view.RequestID, false)
+			return
+		}
+		result, err = sender.RemoteCellularNotificationAction(ctx, target.AlertToken, view.RequestID, view.ExpiresAt, target.AccountID)
+	} else {
+		sender, ok := s.apns.(apns.RemoteCellularControlSender)
+		if !ok {
+			_, _ = s.cellularControls.MarkDelivery(view.RequestID, false)
+			return
+		}
+		result, err = sender.RemoteCellularControl(ctx, target.AlertToken, view.RequestID, view.ExpiresAt, target.AccountID)
+	}
 	accepted := err == nil && result.Status/100 == 2
 	_, _ = s.cellularControls.MarkDelivery(view.RequestID, accepted)
 	if result.DeadToken {
