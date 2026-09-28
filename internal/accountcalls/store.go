@@ -261,6 +261,13 @@ func (s *Store) HasCall(callID string) bool {
 	return ok
 }
 
+func (s *Store) RequiredMediaProtocol(callID string) int {
+	if s.HasCall(callID) {
+		return 1
+	}
+	return 0
+}
+
 func (s *Store) DeviceBusy(deviceID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

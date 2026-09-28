@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
+	"errors"
 	"log/slog"
 	"net/http"
 	"sort"
@@ -20,6 +23,7 @@ type recipientResolveRequest struct {
 
 type userCallCreateRequest struct {
 	RequestID, CallID, TargetUserID string
+	CallerKeyPackage                usercalls.KeyPackage `json:"callerKeyPackage"`
 }
 
 type userCallRoute struct {
@@ -44,7 +48,7 @@ func (s *Server) resolveRecipient(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) createUserCall(w http.ResponseWriter, r *http.Request) {
-	if s.userCalls == nil {
+	if s.userCalls == nil || s.deviceKeys == nil {
 		writeError(w, http.StatusServiceUnavailable, "call_failed")
 		return
 	}
@@ -54,6 +58,10 @@ func (s *Server) createUserCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	identity := identityFrom(r.Context())
+	if err := s.validateUserCallKeyPackage(body.CallerKeyPackage, body.CallID, identity.UserID, identity.DeviceID, usercalls.SideCaller); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if strings.EqualFold(identity.UserID, body.TargetUserID) {
 		writeError(w, http.StatusConflict, "self_call_not_allowed")
 		return
@@ -95,7 +103,7 @@ func (s *Server) createUserCall(w http.ResponseWriter, r *http.Request) {
 	}
 	participant := userCallParticipant(identity)
 	caller := usercalls.PublicCaller{Username: callerRecipient.Username, DisplayName: callerRecipient.DisplayName, PublicIdentity: callerRecipient.PublicIdentity}
-	view, selected, createdNew, err := s.userCalls.Create(body.CallID, body.RequestID, participant, targetRecipient.UserID, caller, targets)
+	view, selected, createdNew, err := s.userCalls.CreateSecure(body.CallID, body.RequestID, participant, targetRecipient.UserID, caller, targets, body.CallerKeyPackage)
 	s.callCreationMu.Unlock()
 	if err != nil {
 		writeUserCallError(w, err)
@@ -133,11 +141,14 @@ func (s *Server) getUserCall(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) mutateUserCall(w http.ResponseWriter, r *http.Request) {
-	if s.userCalls == nil {
+	if s.userCalls == nil || s.deviceKeys == nil {
 		writeError(w, http.StatusServiceUnavailable, "call_failed")
 		return
 	}
-	var body v2CallMutationRequest
+	var body struct {
+		RequestID        string                `json:"requestID"`
+		CalleeKeyPackage *usercalls.KeyPackage `json:"calleeKeyPackage,omitempty"`
+	}
 	if err := decode(w, r, &body); err != nil || !validID(body.RequestID) {
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
@@ -156,7 +167,21 @@ func (s *Server) mutateUserCall(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "unknown action")
 		return
 	}
-	view, _, err := s.userCalls.Mutate(r.PathValue("id"), body.RequestID, userCallParticipant(identityFrom(r.Context())), action)
+	identity := identityFrom(r.Context())
+	if action == usercalls.Accepted {
+		if body.CalleeKeyPackage == nil {
+			writeError(w, http.StatusUpgradeRequired, "e2ee_protocol_required")
+			return
+		}
+		if err := s.validateUserCallKeyPackage(*body.CalleeKeyPackage, r.PathValue("id"), identity.UserID, identity.DeviceID, usercalls.SideCallee); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	} else if body.CalleeKeyPackage != nil {
+		writeError(w, http.StatusBadRequest, "invalid_key_package")
+		return
+	}
+	view, _, err := s.userCalls.MutateSecure(r.PathValue("id"), body.RequestID, userCallParticipant(identity), action, body.CalleeKeyPackage)
 	if err != nil {
 		writeUserCallError(w, err)
 		return
@@ -167,6 +192,26 @@ func (s *Server) mutateUserCall(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, view)
+}
+
+func (s *Server) validateUserCallKeyPackage(value usercalls.KeyPackage, callID, userID, deviceID string, side usercalls.Side) error {
+	if value.ProtocolVersion != 2 || value.KeyEpoch == 0 || !strings.EqualFold(value.CallID, callID) || !strings.EqualFold(value.UserID, userID) || !strings.EqualFold(value.DeviceID, deviceID) || value.Side != side {
+		return errors.New("invalid_key_package")
+	}
+	ephemeral, err := base64.StdEncoding.DecodeString(value.EphemeralPublicKey)
+	signature, signatureErr := base64.StdEncoding.DecodeString(value.Signature)
+	if err != nil || signatureErr != nil || len(ephemeral) != 32 || len(signature) != ed25519.SignatureSize {
+		return errors.New("invalid_key_package")
+	}
+	bundle, ok := s.deviceKeys.ForDevice(userID, deviceID)
+	if !ok || bundle.ProtocolVersion != 2 {
+		return errors.New("device_key_required")
+	}
+	publicKey, err := base64.StdEncoding.DecodeString(bundle.SigningPublicKey)
+	if err != nil || len(publicKey) != ed25519.PublicKeySize || !ed25519.Verify(ed25519.PublicKey(publicKey), usercalls.KeyPackageMessage(value), signature) {
+		return errors.New("invalid_key_package")
+	}
+	return nil
 }
 
 func eligibleUserCallRoutes(devices []accounts.Device) []userCallRoute {

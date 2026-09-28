@@ -14,6 +14,18 @@ func (v combinedCallValidator) ValidateMedia(id, side, token string) bool {
 	return v.account != nil && v.account.ValidateMedia(id, side, token) || v.user != nil && v.user.ValidateMedia(id, side, token)
 }
 
+func (v combinedCallValidator) RequiredMediaProtocol(id string) int {
+	if v.user != nil {
+		if version := v.user.RequiredMediaProtocol(id); version != 0 {
+			return version
+		}
+	}
+	if v.account != nil {
+		return v.account.RequiredMediaProtocol(id)
+	}
+	return 0
+}
+
 func (v combinedCallValidator) MediaPeerJoined(id, side, epoch string) bool {
 	accountReady := v.account != nil && v.account.MediaPeerJoined(id, side, epoch)
 	userReady := v.user != nil && v.user.MediaPeerJoined(id, side, epoch)

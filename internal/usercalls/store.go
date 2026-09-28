@@ -4,7 +4,9 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -56,6 +58,17 @@ type PublicCaller struct {
 	PublicIdentity string `json:"publicIdentity"`
 }
 
+type KeyPackage struct {
+	ProtocolVersion    uint64 `json:"protocolVersion"`
+	KeyEpoch           uint64 `json:"keyEpoch"`
+	CallID             string `json:"callID"`
+	UserID             string `json:"userID"`
+	DeviceID           string `json:"deviceID"`
+	Side               Side   `json:"side"`
+	EphemeralPublicKey string `json:"ephemeralPublicKey"`
+	Signature          string `json:"signature"`
+}
+
 type Target struct {
 	AccountID string
 	DeviceID  string
@@ -70,40 +83,44 @@ type TargetLeg struct {
 }
 
 type Call struct {
-	ID              string
-	Caller          Participant
-	CalleeUserID    string
-	CallerIdentity  PublicCaller
-	Targets         []TargetLeg
-	WinnerAccountID string
-	WinnerDeviceID  string
-	State           State
-	CreatedAt       time.Time
-	RingExpiresAt   time.Time
-	AcceptedAt      time.Time
-	TerminalAt      time.Time
-	TerminalReason  string
-	callerToken     string
-	calleeToken     string
-	peerEpoch       map[Side]string
+	ID               string
+	Caller           Participant
+	CalleeUserID     string
+	CallerIdentity   PublicCaller
+	Targets          []TargetLeg
+	WinnerAccountID  string
+	WinnerDeviceID   string
+	State            State
+	CreatedAt        time.Time
+	RingExpiresAt    time.Time
+	AcceptedAt       time.Time
+	TerminalAt       time.Time
+	TerminalReason   string
+	CallerKeyPackage *KeyPackage
+	CalleeKeyPackage *KeyPackage
+	callerToken      string
+	calleeToken      string
+	peerEpoch        map[Side]string
 }
 
 type View struct {
-	CallID          string        `json:"callID"`
-	LocalSide       Side          `json:"localSide"`
-	State           State         `json:"state"`
-	LegState        LegState      `json:"legState,omitempty"`
-	ExpiresAt       time.Time     `json:"expiresAt"`
-	MediaToken      string        `json:"mediaToken,omitempty"`
-	RingExpiresAt   time.Time     `json:"ringExpiresAt,omitempty"`
-	AcceptedAt      *time.Time    `json:"acceptedAt,omitempty"`
-	TerminalAt      *time.Time    `json:"terminalAt,omitempty"`
-	TerminalReason  string        `json:"terminalReason,omitempty"`
-	DeliveryStatus  string        `json:"deliveryStatus,omitempty"`
-	PeerReady       bool          `json:"peerReady,omitempty"`
-	CreatedNew      bool          `json:"createdNew,omitempty"`
-	MutationApplied *bool         `json:"mutationApplied,omitempty"`
-	Caller          *PublicCaller `json:"caller,omitempty"`
+	CallID           string        `json:"callID"`
+	LocalSide        Side          `json:"localSide"`
+	State            State         `json:"state"`
+	LegState         LegState      `json:"legState,omitempty"`
+	ExpiresAt        time.Time     `json:"expiresAt"`
+	MediaToken       string        `json:"mediaToken,omitempty"`
+	RingExpiresAt    time.Time     `json:"ringExpiresAt,omitempty"`
+	AcceptedAt       *time.Time    `json:"acceptedAt,omitempty"`
+	TerminalAt       *time.Time    `json:"terminalAt,omitempty"`
+	TerminalReason   string        `json:"terminalReason,omitempty"`
+	DeliveryStatus   string        `json:"deliveryStatus,omitempty"`
+	PeerReady        bool          `json:"peerReady,omitempty"`
+	CreatedNew       bool          `json:"createdNew,omitempty"`
+	MutationApplied  *bool         `json:"mutationApplied,omitempty"`
+	Caller           *PublicCaller `json:"caller,omitempty"`
+	CallerKeyPackage *KeyPackage   `json:"callerKeyPackage,omitempty"`
+	CalleeKeyPackage *KeyPackage   `json:"calleeKeyPackage,omitempty"`
 }
 
 type createRecord struct {
@@ -140,6 +157,14 @@ func (s *Store) SetClock(now func() time.Time) {
 }
 
 func (s *Store) Create(callID, requestID string, caller Participant, targetUserID string, identity PublicCaller, candidates []Target) (View, []Target, bool, error) {
+	return s.create(callID, requestID, caller, targetUserID, identity, candidates, nil)
+}
+
+func (s *Store) CreateSecure(callID, requestID string, caller Participant, targetUserID string, identity PublicCaller, candidates []Target, keyPackage KeyPackage) (View, []Target, bool, error) {
+	return s.create(callID, requestID, caller, targetUserID, identity, candidates, &keyPackage)
+}
+
+func (s *Store) create(callID, requestID string, caller Participant, targetUserID string, identity PublicCaller, candidates []Target, keyPackage *KeyPackage) (View, []Target, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gcLocked()
@@ -152,7 +177,7 @@ func (s *Store) Create(callID, requestID string, caller Participant, targetUserI
 	if caller.UserID == targetUserID {
 		return View{}, nil, false, callError("self_call_not_allowed")
 	}
-	parameters := strings.Join([]string{callID, caller.UserID, caller.AccountID, caller.DeviceID, targetUserID}, ":")
+	parameters := strings.Join([]string{callID, caller.UserID, caller.AccountID, caller.DeviceID, targetUserID, keyPackageFingerprint(keyPackage)}, ":")
 	if prior, ok := s.createRequests[requestID]; ok {
 		if prior.Parameters != parameters {
 			return View{}, nil, false, callError("idempotency_conflict")
@@ -192,7 +217,7 @@ func (s *Store) Create(callID, requestID string, caller Participant, targetUserI
 	now := s.now().UTC()
 	call := &Call{
 		ID: callID, Caller: caller, CalleeUserID: targetUserID, CallerIdentity: identity,
-		Targets: legs, State: Ringing, CreatedAt: now, RingExpiresAt: now.Add(s.ringTimeout), peerEpoch: map[Side]string{},
+		Targets: legs, State: Ringing, CreatedAt: now, RingExpiresAt: now.Add(s.ringTimeout), CallerKeyPackage: cloneKeyPackage(keyPackage), peerEpoch: map[Side]string{},
 	}
 	s.calls[callID] = call
 	s.createRequests[requestID] = createRecord{Parameters: parameters, CallID: callID, CreatedAt: now}
@@ -213,6 +238,14 @@ func (s *Store) Get(callID string, participant Participant) (View, error) {
 }
 
 func (s *Store) Mutate(callID, requestID string, participant Participant, action State) (View, bool, error) {
+	return s.mutate(callID, requestID, participant, action, nil)
+}
+
+func (s *Store) MutateSecure(callID, requestID string, participant Participant, action State, keyPackage *KeyPackage) (View, bool, error) {
+	return s.mutate(callID, requestID, participant, action, keyPackage)
+}
+
+func (s *Store) mutate(callID, requestID string, participant Participant, action State, keyPackage *KeyPackage) (View, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gcLocked()
@@ -228,8 +261,9 @@ func (s *Store) Mutate(callID, requestID string, participant Participant, action
 		return View{}, false, err
 	}
 	key := strings.Join([]string{callID, participant.AccountID, participant.DeviceID, requestID}, ":")
+	operation := string(action) + "\x00" + keyPackageFingerprint(keyPackage)
 	if prior, ok := s.mutationRequests[key]; ok {
-		if prior.Operation != string(action) {
+		if prior.Operation != operation {
 			return View{}, false, callError("idempotency_conflict")
 		}
 		view, viewErr := s.viewLocked(call, participant)
@@ -250,6 +284,13 @@ func (s *Store) Mutate(callID, requestID string, participant Participant, action
 		if call.State == Expired {
 			return View{}, false, callError("call_expired")
 		}
+		if call.CallerKeyPackage != nil {
+			if keyPackage == nil || normalize(keyPackage.CallID) != call.ID || normalize(keyPackage.UserID) != participant.UserID || normalize(keyPackage.DeviceID) != participant.DeviceID || keyPackage.Side != SideCallee || keyPackage.ProtocolVersion != 2 || keyPackage.KeyEpoch == 0 {
+				return View{}, false, callError("invalid_key_package")
+			}
+		} else if keyPackage != nil {
+			return View{}, false, callError("idempotency_conflict")
+		}
 		if call.State == Accepted {
 			if call.WinnerAccountID != participant.AccountID || call.WinnerDeviceID != participant.DeviceID {
 				call.Targets[targetIndex].ResponseState = LegAnsweredElsewhere
@@ -268,6 +309,7 @@ func (s *Store) Mutate(callID, requestID string, participant Participant, action
 			return View{}, false, tokenErr
 		}
 		call.State, call.AcceptedAt = Accepted, now
+		call.CalleeKeyPackage = cloneKeyPackage(keyPackage)
 		call.WinnerAccountID, call.WinnerDeviceID = participant.AccountID, participant.DeviceID
 		call.callerToken, call.calleeToken = callerToken, calleeToken
 		for index := range call.Targets {
@@ -346,7 +388,7 @@ func (s *Store) Mutate(callID, requestID string, participant Participant, action
 	default:
 		return View{}, false, callError("call_failed")
 	}
-	s.mutationRequests[key] = mutationRecord{Operation: string(action), CreatedAt: now}
+	s.mutationRequests[key] = mutationRecord{Operation: operation, CreatedAt: now}
 	view, viewErr := s.viewLocked(call, participant)
 	if viewErr != nil {
 		return View{}, false, viewErr
@@ -441,6 +483,19 @@ func (s *Store) HasCall(callID string) bool {
 	return ok
 }
 
+func (s *Store) RequiredMediaProtocol(callID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	call := s.calls[normalize(callID)]
+	if call == nil {
+		return 0
+	}
+	if call.CallerKeyPackage != nil {
+		return 2
+	}
+	return 1
+}
+
 func (s *Store) DeviceBusy(deviceID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -464,7 +519,8 @@ func (s *Store) viewLocked(call *Call, participant Participant) (View, error) {
 		CallID: call.ID, LocalSide: side, State: call.State,
 		ExpiresAt: call.RingExpiresAt.UTC().Truncate(time.Second), RingExpiresAt: call.RingExpiresAt.UTC(),
 		TerminalReason: call.TerminalReason, DeliveryStatus: deliveryStatus(call),
-		PeerReady: call.peerEpoch[SideCaller] != "" && call.peerEpoch[SideCallee] != "",
+		PeerReady:        call.peerEpoch[SideCaller] != "" && call.peerEpoch[SideCallee] != "",
+		CallerKeyPackage: cloneKeyPackage(call.CallerKeyPackage), CalleeKeyPackage: cloneKeyPackage(call.CalleeKeyPackage),
 	}
 	if side == SideCallee {
 		view.LegState = call.Targets[index].ResponseState
@@ -487,6 +543,35 @@ func (s *Store) viewLocked(call *Call, participant Participant) (View, error) {
 		}
 	}
 	return view, nil
+}
+
+func cloneKeyPackage(value *KeyPackage) *KeyPackage {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	return &copyValue
+}
+
+func keyPackageFingerprint(value *KeyPackage) string {
+	if value == nil {
+		return "legacy"
+	}
+	data, _ := json.Marshal(value)
+	return string(data)
+}
+
+func KeyPackageMessage(value KeyPackage) []byte {
+	return []byte(strings.Join([]string{
+		"wsc-call-key-v2",
+		normalize(value.CallID),
+		normalize(value.UserID),
+		normalize(value.DeviceID),
+		string(value.Side),
+		strconv.FormatUint(value.ProtocolVersion, 10),
+		strconv.FormatUint(value.KeyEpoch, 10),
+		value.EphemeralPublicKey,
+	}, "\n"))
 }
 
 func participantFor(call *Call, participant Participant) (Side, int, error) {

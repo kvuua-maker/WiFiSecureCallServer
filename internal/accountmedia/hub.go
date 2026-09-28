@@ -15,14 +15,17 @@ import (
 )
 
 const (
-	audioPacketSize   = 674
-	controlPacketSize = 34
-	outboundCapacity  = 64
-	maxViolations     = 5
+	legacyAudioPacketSize    = 674
+	audioPacketSize          = legacyAudioPacketSize
+	encryptedAudioPacketSize = 707
+	controlPacketSize        = 34
+	outboundCapacity         = 64
+	maxViolations            = 5
 )
 
 type Validator interface {
 	ValidateMedia(id, side, token string) bool
+	RequiredMediaProtocol(id string) int
 	MediaPeerJoined(id, side, epoch string) bool
 	MediaPeerLeft(id, side, epoch string)
 	IsAccepted(id string) bool
@@ -63,8 +66,17 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	version := 1
-	if r.URL.Query().Get("protocolVersion") == "2" {
+	switch r.URL.Query().Get("protocolVersion") {
+	case "", "1":
+	case "2":
 		version = 2
+	default:
+		http.Error(w, "unsupported media protocol", http.StatusUpgradeRequired)
+		return
+	}
+	if h.validator.RequiredMediaProtocol(id) != version {
+		http.Error(w, "unsupported media protocol", http.StatusUpgradeRequired)
+		return
 	}
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -84,7 +96,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.close(websocket.CloseNormalClosure, "closed")
 		slog.Info("account media disconnected", "callID", id, "side", side, "epoch", p.epoch, "durationMilliseconds", time.Since(started).Milliseconds(), "binaryMessages", stats.binaryMessages, "validAudioPackets", stats.validAudioPackets, "audioBytes", stats.audioBytes, "invalidPackets", stats.invalidPackets, "relayedPackets", stats.relayedPackets, "relayFailures", stats.relayFailures, "peerMissingCount", stats.peerMissingCount, "closeCode", closeCode, "closeReason", closeReason)
 	}()
-	conn.SetReadLimit(audioPacketSize)
+	conn.SetReadLimit(encryptedAudioPacketSize)
 	_ = conn.SetReadDeadline(time.Now().Add(40 * time.Second))
 	conn.SetPongHandler(func(string) error { return conn.SetReadDeadline(time.Now().Add(40 * time.Second)) })
 	firstAudioLogged, violations := false, 0
@@ -110,7 +122,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.close(websocket.ClosePolicyViolation, "rate limit")
 			return
 		}
-		if kind != websocket.BinaryMessage || !validPacket(data, id) {
+		if kind != websocket.BinaryMessage || !validPacket(data, id, side, p.protocolVersion) {
 			violations++
 			stats.invalidPackets++
 			if violations >= maxViolations {
@@ -121,7 +133,11 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		stats.binaryMessages++
 		if data[1] == 1 {
-			sequence := binary.BigEndian.Uint64(data[18:26])
+			sequenceOffset := 18
+			if data[0] == 2 {
+				sequenceOffset = 23
+			}
+			sequence := binary.BigEndian.Uint64(data[sequenceOffset : sequenceOffset+8])
 			if p.hasSequence && sequence <= p.lastSequence {
 				stats.invalidPackets++
 				continue
@@ -224,7 +240,7 @@ func (h *Hub) sendPeerReady(id string) {
 	h.mu.Lock()
 	caller, callee := h.peers[id]["caller"], h.peers[id]["callee"]
 	h.mu.Unlock()
-	if caller == nil || callee == nil || caller.protocolVersion < 2 || callee.protocolVersion < 2 {
+	if caller == nil || callee == nil {
 		return
 	}
 	packet := controlPacket(id, 3)
@@ -261,14 +277,30 @@ func (h *Hub) CloseAll(reason string) {
 	}
 }
 
-func validPacket(data []byte, id string) bool {
-	if len(data) != audioPacketSize && len(data) != controlPacketSize || data[0] != 1 || data[1] < 1 || data[1] > 3 {
+func validPacket(data []byte, id, side string, negotiatedVersion int) bool {
+	if len(data) < controlPacketSize || data[1] < 1 || data[1] > 3 {
 		return false
 	}
-	if data[1] == 1 && len(data) != audioPacketSize || data[1] != 1 && len(data) != controlPacketSize {
+	if data[1] != 1 {
+		return data[0] == 1 && len(data) == controlPacketSize && uuidString(data[2:18]) == id
+	}
+	if data[0] == 1 {
+		return negotiatedVersion == 1 && len(data) == legacyAudioPacketSize && uuidString(data[2:18]) == id
+	}
+	if data[0] != 2 || negotiatedVersion != 2 || len(data) != encryptedAudioPacketSize || uuidString(data[2:18]) != id {
 		return false
 	}
-	return uuidString(data[2:18]) == id
+	direction := byte(1)
+	if side == "callee" {
+		direction = 2
+	} else if side != "caller" {
+		return false
+	}
+	if data[18] != direction || binary.BigEndian.Uint32(data[19:23]) == 0 {
+		return false
+	}
+	sequence := binary.BigEndian.Uint64(data[23:31])
+	return binary.BigEndian.Uint32(data[39:43]) == binary.BigEndian.Uint32(data[19:23]) && binary.BigEndian.Uint64(data[43:51]) == sequence
 }
 func strictBearer(value string) (string, bool) {
 	if !strings.HasPrefix(value, "Bearer ") || strings.Count(value, " ") != 1 {
