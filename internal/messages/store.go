@@ -212,7 +212,8 @@ func (s *Store) Page(conversationID, userID, cursor string, limit int) (Page, er
 	if limit > 100 {
 		limit = 100
 	}
-	start := 0
+	ids := s.state.ConversationMessages[conversationID]
+	end := len(ids)
 	if cursor != "" {
 		raw, err := base64.RawURLEncoding.DecodeString(cursor)
 		if err != nil {
@@ -220,9 +221,9 @@ func (s *Store) Page(conversationID, userID, cursor string, limit int) (Page, er
 		}
 		marker := string(raw)
 		found := false
-		for i, id := range s.state.ConversationMessages[conversationID] {
+		for i, id := range ids {
 			if id == marker {
-				start = i + 1
+				end = i
 				found = true
 				break
 			}
@@ -231,10 +232,9 @@ func (s *Store) Page(conversationID, userID, cursor string, limit int) (Page, er
 			return Page{}, failure("invalid_cursor")
 		}
 	}
-	ids := s.state.ConversationMessages[conversationID]
-	end := start + limit
-	if end > len(ids) {
-		end = len(ids)
+	start := end - limit
+	if start < 0 {
+		start = 0
 	}
 	items := make([]Message, 0, end-start)
 	for _, id := range ids[start:end] {
@@ -243,8 +243,8 @@ func (s *Store) Page(conversationID, userID, cursor string, limit int) (Page, er
 		}
 	}
 	next := ""
-	if end < len(ids) && end > 0 {
-		next = base64.RawURLEncoding.EncodeToString([]byte(ids[end-1]))
+	if start > 0 {
+		next = base64.RawURLEncoding.EncodeToString([]byte(ids[start]))
 	}
 	return Page{Messages: items, NextCursor: next}, nil
 }

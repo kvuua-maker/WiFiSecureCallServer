@@ -105,6 +105,10 @@ type Call struct {
 
 type View struct {
 	CallID           string        `json:"callID"`
+	CallerUserID     string        `json:"callerUserID"`
+	CallerDeviceID   string        `json:"callerDeviceID"`
+	CalleeUserID     string        `json:"calleeUserID"`
+	CalleeDeviceID   string        `json:"calleeDeviceID,omitempty"`
 	LocalSide        Side          `json:"localSide"`
 	State            State         `json:"state"`
 	LegState         LegState      `json:"legState,omitempty"`
@@ -285,7 +289,7 @@ func (s *Store) mutate(callID, requestID string, participant Participant, action
 			return View{}, false, callError("call_expired")
 		}
 		if call.CallerKeyPackage != nil {
-			if keyPackage == nil || normalize(keyPackage.CallID) != call.ID || normalize(keyPackage.UserID) != participant.UserID || normalize(keyPackage.DeviceID) != participant.DeviceID || keyPackage.Side != SideCallee || keyPackage.ProtocolVersion != 2 || keyPackage.KeyEpoch == 0 {
+			if keyPackage == nil || normalize(keyPackage.CallID) != call.ID || normalize(keyPackage.UserID) != participant.UserID || normalize(keyPackage.DeviceID) != participant.DeviceID || keyPackage.Side != SideCallee || keyPackage.ProtocolVersion != 2 || keyPackage.KeyEpoch == 0 || keyPackage.KeyEpoch != call.CallerKeyPackage.KeyEpoch {
 				return View{}, false, callError("invalid_key_package")
 			}
 		} else if keyPackage != nil {
@@ -516,7 +520,8 @@ func (s *Store) viewLocked(call *Call, participant Participant) (View, error) {
 		return View{}, err
 	}
 	view := View{
-		CallID: call.ID, LocalSide: side, State: call.State,
+		CallID: call.ID, CallerUserID: call.Caller.UserID, CallerDeviceID: call.Caller.DeviceID,
+		CalleeUserID: call.CalleeUserID, CalleeDeviceID: call.WinnerDeviceID, LocalSide: side, State: call.State,
 		ExpiresAt: call.RingExpiresAt.UTC().Truncate(time.Second), RingExpiresAt: call.RingExpiresAt.UTC(),
 		TerminalReason: call.TerminalReason, DeliveryStatus: deliveryStatus(call),
 		PeerReady:        call.peerEpoch[SideCaller] != "" && call.peerEpoch[SideCallee] != "",

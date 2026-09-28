@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"log/slog"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -195,7 +196,7 @@ func (s *Server) mutateUserCall(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) validateUserCallKeyPackage(value usercalls.KeyPackage, callID, userID, deviceID string, side usercalls.Side) error {
-	if value.ProtocolVersion != 2 || value.KeyEpoch == 0 || !strings.EqualFold(value.CallID, callID) || !strings.EqualFold(value.UserID, userID) || !strings.EqualFold(value.DeviceID, deviceID) || value.Side != side {
+	if value.ProtocolVersion != 2 || value.KeyEpoch == 0 || value.KeyEpoch > math.MaxUint32 || !strings.EqualFold(value.CallID, callID) || !strings.EqualFold(value.UserID, userID) || !strings.EqualFold(value.DeviceID, deviceID) || value.Side != side {
 		return errors.New("invalid_key_package")
 	}
 	ephemeral, err := base64.StdEncoding.DecodeString(value.EphemeralPublicKey)
