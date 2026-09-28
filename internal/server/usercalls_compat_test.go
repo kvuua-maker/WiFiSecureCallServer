@@ -22,11 +22,7 @@ func TestV3SkipsDeviceBusyInExistingV2Call(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	response := performUserRequest(t, fixture.server, http.MethodPost, "/v3/calls", fixture.caller.AccessToken, map[string]string{
-		"requestID":    "40404040-4040-4040-8040-404040404040",
-		"callID":       "41414141-4141-4141-8141-414141414141",
-		"targetUserID": fixture.targetUserID,
-	})
+	response := performUserRequest(t, fixture.server, http.MethodPost, "/v3/calls", fixture.caller.AccessToken, fixtureCreateBody(t, fixture, "40404040-4040-4040-8040-404040404040", "41414141-4141-4141-8141-414141414141", fixture.targetUserID))
 	if response.Code != http.StatusOK {
 		t.Fatalf("create status=%d body=%q", response.Code, response.Body.String())
 	}
@@ -51,11 +47,7 @@ func TestV2AndV3CallIDNamespacesCannotCollide(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	response := performUserRequest(t, fixture.server, http.MethodPost, "/v3/calls", fixture.caller.AccessToken, map[string]string{
-		"requestID":    "44444444-4444-4444-8444-444444444444",
-		"callID":       callID,
-		"targetUserID": fixture.targetUserID,
-	})
+	response := performUserRequest(t, fixture.server, http.MethodPost, "/v3/calls", fixture.caller.AccessToken, fixtureCreateBody(t, fixture, "44444444-4444-4444-8444-444444444444", callID, fixture.targetUserID))
 	if response.Code != http.StatusConflict {
 		t.Fatalf("cross-store collision status=%d body=%q", response.Code, response.Body.String())
 	}

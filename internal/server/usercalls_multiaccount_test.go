@@ -32,10 +32,7 @@ func TestV3FanoutIncludesReadyDevicesAcrossEveryActiveTargetAccount(t *testing.T
 		t.Fatal(err)
 	}
 	callID := "22222222-2222-4222-8222-222222222222"
-	response := performUserRequest(t, fixture.server, http.MethodPost, "/v3/calls", fixture.caller.AccessToken, map[string]string{
-		"requestID": "23232323-2323-4323-8323-232323232323",
-		"callID":    callID, "targetUserID": fixture.targetUserID,
-	})
+	response := performUserRequest(t, fixture.server, http.MethodPost, "/v3/calls", fixture.caller.AccessToken, fixtureCreateBody(t, fixture, "23232323-2323-4323-8323-232323232323", callID, fixture.targetUserID))
 	if response.Code != http.StatusOK {
 		t.Fatalf("create status=%d body=%q", response.Code, response.Body.String())
 	}
@@ -60,10 +57,7 @@ func TestV3ExcludesNonReadyDevicesWithoutBlockingReadySibling(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	response := performUserRequest(t, fixture.server, http.MethodPost, "/v3/calls", fixture.caller.AccessToken, map[string]string{
-		"requestID": "27272727-2727-4727-8727-272727272727",
-		"callID":    "28282828-2828-4828-8828-282828282828", "targetUserID": fixture.targetUserID,
-	})
+	response := performUserRequest(t, fixture.server, http.MethodPost, "/v3/calls", fixture.caller.AccessToken, fixtureCreateBody(t, fixture, "27272727-2727-4727-8727-272727272727", "28282828-2828-4828-8828-282828282828", fixture.targetUserID))
 	if response.Code != http.StatusOK {
 		t.Fatalf("create status=%d body=%q", response.Code, response.Body.String())
 	}

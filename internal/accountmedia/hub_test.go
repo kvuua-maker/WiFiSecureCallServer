@@ -3,6 +3,7 @@ package accountmedia
 import (
 	"encoding/binary"
 	"encoding/hex"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -39,14 +40,26 @@ func acceptedStore(t *testing.T) (*accountcalls.Store, string, string) {
 
 func dialPeer(t *testing.T, base, side, token string) (*websocket.Conn, *http.Response, error) {
 	t.Helper()
-	url := "ws" + strings.TrimPrefix(base, "http") + "?callID=" + mediaCall + "&side=" + side + "&protocolVersion=2"
+	url := "ws" + strings.TrimPrefix(base, "http") + "?callID=" + mediaCall + "&side=" + side + "&protocolVersion=1"
 	header := http.Header{"Authorization": []string{"Bearer " + token}}
 	return websocket.DefaultDialer.Dial(url, header)
 }
 
+func testHTTPServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(handler)
+	server.Listener = listener
+	server.Start()
+	return server
+}
+
 func TestCallerAndCalleeTokensAreSideBound(t *testing.T) {
 	store, callerToken, calleeToken := acceptedStore(t)
-	server := httptest.NewServer(New(store))
+	server := testHTTPServer(t, New(store))
 	defer server.Close()
 
 	if conn, response, err := dialPeer(t, server.URL, "callee", callerToken); err == nil {
@@ -66,7 +79,7 @@ func TestCallerAndCalleeTokensAreSideBound(t *testing.T) {
 func TestBothSidesPeerReadyAndBidirectionalRelay(t *testing.T) {
 	store, callerToken, calleeToken := acceptedStore(t)
 	hub := New(store)
-	server := httptest.NewServer(hub)
+	server := testHTTPServer(t, hub)
 	defer server.Close()
 
 	caller, _, err := dialPeer(t, server.URL, "caller", callerToken)
@@ -125,4 +138,52 @@ func audioPacket(t *testing.T, sequence uint64, fill byte) []byte {
 		packet[index] = fill
 	}
 	return packet
+}
+
+func encryptedAudioPacket(t *testing.T, side string, sequence uint64, fill byte) []byte {
+	t.Helper()
+	packet := make([]byte, encryptedAudioPacketSize)
+	packet[0], packet[1] = 2, 1
+	raw, err := hex.DecodeString(strings.ReplaceAll(mediaCall, "-", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(packet[2:18], raw)
+	if side == "caller" {
+		packet[18] = 1
+	} else {
+		packet[18] = 2
+	}
+	binary.BigEndian.PutUint32(packet[19:23], 1)
+	binary.BigEndian.PutUint64(packet[23:31], sequence)
+	binary.BigEndian.PutUint64(packet[31:39], sequence*20_000)
+	binary.BigEndian.PutUint32(packet[39:43], 1)
+	binary.BigEndian.PutUint64(packet[43:51], sequence)
+	for index := 51; index < len(packet); index++ {
+		packet[index] = fill
+	}
+	return packet
+}
+
+func TestMediaPacketVersionsAreStrictAndOpaque(t *testing.T) {
+	legacy := audioPacket(t, 1, 0x33)
+	encrypted := encryptedAudioPacket(t, "caller", 2, 0x44)
+	if !validPacket(legacy, mediaCall, "caller", 1) {
+		t.Fatal("valid legacy packet rejected")
+	}
+	if !validPacket(encrypted, mediaCall, "caller", 2) {
+		t.Fatal("valid encrypted packet rejected")
+	}
+	if validPacket(legacy, mediaCall, "caller", 2) || validPacket(encrypted, mediaCall, "caller", 1) {
+		t.Fatal("media protocol downgrade accepted")
+	}
+	wrongDirection := append([]byte(nil), encrypted...)
+	wrongDirection[18] = 2
+	if validPacket(wrongDirection, mediaCall, "caller", 2) {
+		t.Fatal("wrong direction accepted")
+	}
+	oversized := append(encrypted, 0)
+	if validPacket(oversized, mediaCall, "caller", 2) {
+		t.Fatal("oversized frame accepted")
+	}
 }

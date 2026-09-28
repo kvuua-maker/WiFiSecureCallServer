@@ -3,6 +3,9 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -18,6 +21,7 @@ import (
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/apns"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/appleauth"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/calls"
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/devicekeys"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/devices"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/phoneauth"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/usercalls"
@@ -83,6 +87,7 @@ type userCallFixture struct {
 	targetUserID           string
 	targetIOSToken         string
 	targetWatchToken       string
+	signingKeys            map[string]ed25519.PrivateKey
 }
 
 func newUserCallFixture(t *testing.T, failures map[string]apns.Result) userCallFixture {
@@ -135,7 +140,52 @@ func newUserCallFixture(t *testing.T, failures map[string]apns.Result) userCallF
 	push := &userCallPushFake{failFor: failures}
 	accountCallStore := accountcalls.New(30 * time.Second)
 	server := NewWithCallStores("a", "b", calls.New(30*time.Second, 0), deviceStore, push, auth, accountCallStore, usercalls.New(30*time.Second))
-	return userCallFixture{server: server, auth: auth, accountStore: accountStore, accountCalls: accountCallStore, push: push, caller: caller, targetIOS: targetIOS, targetWatch: targetWatch, unrelated: unrelated, targetUserID: targetIOS.User.UserID, targetIOSToken: iosToken, targetWatchToken: watchToken}
+	keys := map[string]ed25519.PrivateKey{}
+	for _, session := range []phoneauth.SessionResult{caller, targetIOS, targetWatch, unrelated} {
+		keys[session.DeviceID] = registerFixtureDeviceKey(t, server.deviceKeys, session)
+	}
+	return userCallFixture{server: server, auth: auth, accountStore: accountStore, accountCalls: accountCallStore, push: push, caller: caller, targetIOS: targetIOS, targetWatch: targetWatch, unrelated: unrelated, targetUserID: targetIOS.User.UserID, targetIOSToken: iosToken, targetWatchToken: watchToken, signingKeys: keys}
+}
+
+func registerFixtureDeviceKey(t *testing.T, store *devicekeys.Store, session phoneauth.SessionResult) ed25519.PrivateKey {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agreement := make([]byte, 32)
+	if _, err = rand.Read(agreement); err != nil {
+		t.Fatal(err)
+	}
+	request := devicekeys.Registration{
+		RequestID: strings.ToLower(session.DeviceID), DeviceID: strings.ToLower(session.DeviceID),
+		SigningPublicKey: base64.StdEncoding.EncodeToString(publicKey), AgreementPublicKey: base64.StdEncoding.EncodeToString(agreement),
+		KeyVersion: 1, ProtocolVersion: 2,
+	}
+	request.ProofSignature = base64.StdEncoding.EncodeToString(ed25519.Sign(privateKey, devicekeys.ProofMessage(request)))
+	if _, _, err = store.Register(session.User.UserID, session.DeviceID, request); err != nil {
+		t.Fatal(err)
+	}
+	return privateKey
+}
+
+func fixtureKeyPackage(t *testing.T, fixture userCallFixture, session phoneauth.SessionResult, callID string, side usercalls.Side) usercalls.KeyPackage {
+	t.Helper()
+	ephemeral := make([]byte, 32)
+	if _, err := rand.Read(ephemeral); err != nil {
+		t.Fatal(err)
+	}
+	value := usercalls.KeyPackage{ProtocolVersion: 2, KeyEpoch: 1, CallID: callID, UserID: session.User.UserID, DeviceID: session.DeviceID, Side: side, EphemeralPublicKey: base64.StdEncoding.EncodeToString(ephemeral)}
+	value.Signature = base64.StdEncoding.EncodeToString(ed25519.Sign(fixture.signingKeys[session.DeviceID], usercalls.KeyPackageMessage(value)))
+	return value
+}
+
+func fixtureCreateBody(t *testing.T, fixture userCallFixture, requestID, callID, targetUserID string) map[string]any {
+	return map[string]any{"requestID": requestID, "callID": callID, "targetUserID": targetUserID, "callerKeyPackage": fixtureKeyPackage(t, fixture, fixture.caller, callID, usercalls.SideCaller)}
+}
+
+func fixtureAcceptBody(t *testing.T, fixture userCallFixture, requestID, callID string, session phoneauth.SessionResult) map[string]any {
+	return map[string]any{"requestID": requestID, "calleeKeyPackage": fixtureKeyPackage(t, fixture, session, callID, usercalls.SideCallee)}
 }
 
 func performUserRequest(t *testing.T, server *Server, method, path, token string, body any) *httptest.ResponseRecorder {
@@ -196,15 +246,16 @@ func TestV3ResolverAndCrossUserFanoutFirstAnswer(t *testing.T) {
 		}
 	}
 	callID := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-	create := performUserRequest(t, fixture.server, http.MethodPost, "/v3/calls", fixture.caller.AccessToken, map[string]string{
-		"requestID": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "callID": callID, "targetUserID": fixture.targetUserID,
-	})
+	create := performUserRequest(t, fixture.server, http.MethodPost, "/v3/calls", fixture.caller.AccessToken, fixtureCreateBody(t, fixture, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", callID, fixture.targetUserID))
 	if create.Code != http.StatusOK {
 		t.Fatalf("create status=%d body=%q", create.Code, create.Body.String())
 	}
 	created := decodeUserCallView(t, create)
 	if created.State != usercalls.Ringing || created.LocalSide != usercalls.SideCaller || created.MediaToken != "" {
 		t.Fatalf("created=%+v", created)
+	}
+	if fixture.server.userCalls.RequiredMediaProtocol(callID) != 2 {
+		t.Fatal("secure cross-user call did not require media protocol v2")
 	}
 	pushes := waitForPushes(t, fixture.push, 2)
 	if len(pushes) != 2 {
@@ -220,7 +271,7 @@ func TestV3ResolverAndCrossUserFanoutFirstAnswer(t *testing.T) {
 	if seenPlatforms["iOS"] != "voip" || seenPlatforms["watchOS"] != "alert" {
 		t.Fatalf("push preferences=%+v", seenPlatforms)
 	}
-	accept := performUserRequest(t, fixture.server, http.MethodPost, "/v3/calls/"+callID+"/accept", fixture.targetWatch.AccessToken, map[string]string{"requestID": "cccccccc-cccc-4ccc-8ccc-cccccccccccc"})
+	accept := performUserRequest(t, fixture.server, http.MethodPost, "/v3/calls/"+callID+"/accept", fixture.targetWatch.AccessToken, fixtureAcceptBody(t, fixture, "cccccccc-cccc-4ccc-8ccc-cccccccccccc", callID, fixture.targetWatch))
 	winner := decodeUserCallView(t, accept)
 	if accept.Code != http.StatusOK || winner.State != usercalls.Accepted || winner.LegState != usercalls.LegAccepted || winner.MediaToken == "" {
 		t.Fatalf("winner status=%d view=%+v", accept.Code, winner)
@@ -243,9 +294,7 @@ func TestV3ResolverAndCrossUserFanoutFirstAnswer(t *testing.T) {
 
 func TestV3SelfCallAndPrivateResolverInputsRejected(t *testing.T) {
 	fixture := newUserCallFixture(t, nil)
-	self := performUserRequest(t, fixture.server, http.MethodPost, "/v3/calls", fixture.caller.AccessToken, map[string]string{
-		"requestID": "dddddddd-dddd-4ddd-8ddd-dddddddddddd", "callID": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", "targetUserID": fixture.caller.User.UserID,
-	})
+	self := performUserRequest(t, fixture.server, http.MethodPost, "/v3/calls", fixture.caller.AccessToken, fixtureCreateBody(t, fixture, "dddddddd-dddd-4ddd-8ddd-dddddddddddd", "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", fixture.caller.User.UserID))
 	if self.Code != http.StatusConflict || !strings.Contains(self.Body.String(), "self_call_not_allowed") {
 		t.Fatalf("self status=%d body=%q", self.Code, self.Body.String())
 	}
@@ -260,9 +309,7 @@ func TestV3SelfCallAndPrivateResolverInputsRejected(t *testing.T) {
 func TestV3PartialAPNSFailurePreservesOtherTargetAndAllFailureTerminates(t *testing.T) {
 	fixture := newUserCallFixture(t, map[string]apns.Result{strings.Repeat("a", 64): {Status: 410, Reason: "Unregistered", DeadToken: true}})
 	callID := "ffffffff-ffff-4fff-8fff-ffffffffffff"
-	create := performUserRequest(t, fixture.server, http.MethodPost, "/v3/calls", fixture.caller.AccessToken, map[string]string{
-		"requestID": "12121212-1212-4212-8212-121212121212", "callID": callID, "targetUserID": fixture.targetUserID,
-	})
+	create := performUserRequest(t, fixture.server, http.MethodPost, "/v3/calls", fixture.caller.AccessToken, fixtureCreateBody(t, fixture, "12121212-1212-4212-8212-121212121212", callID, fixture.targetUserID))
 	if create.Code != http.StatusOK {
 		t.Fatalf("create=%d %q", create.Code, create.Body.String())
 	}
@@ -278,9 +325,7 @@ func TestV3PartialAPNSFailurePreservesOtherTargetAndAllFailureTerminates(t *test
 		strings.Repeat("b", 64): {Status: 400, Reason: "DeviceTokenNotForTopic", DeadToken: true},
 	})
 	allCallID := "13131313-1313-4313-8313-131313131313"
-	created := performUserRequest(t, all.server, http.MethodPost, "/v3/calls", all.caller.AccessToken, map[string]string{
-		"requestID": "14141414-1414-4414-8414-141414141414", "callID": allCallID, "targetUserID": all.targetUserID,
-	})
+	created := performUserRequest(t, all.server, http.MethodPost, "/v3/calls", all.caller.AccessToken, fixtureCreateBody(t, all, "14141414-1414-4414-8414-141414141414", allCallID, all.targetUserID))
 	if created.Code != http.StatusOK {
 		t.Fatalf("all create=%d %q", created.Code, created.Body.String())
 	}
