@@ -230,6 +230,35 @@ func waitForPushes(t *testing.T, fake *userCallPushFake, count int) []capturedUs
 	return nil
 }
 
+func waitForUserCallView(t *testing.T, server *Server, token, callID string, ready func(usercalls.View) bool) usercalls.View {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var last usercalls.View
+	for time.Now().Before(deadline) {
+		response := performUserRequest(t, server, http.MethodGet, "/v3/calls/"+callID, token, nil)
+		last = decodeUserCallView(t, response)
+		if ready(last) {
+			return last
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("call %s did not reach expected state: %+v", callID, last)
+	return usercalls.View{}
+}
+
+func waitForAccountPushTokenCleared(t *testing.T, auth *phoneauth.Service, accountID, deviceID, pushType string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		device, found := auth.DeviceForAccount(accountID, deviceID)
+		if found && ((pushType == "voip" && device.VoIPToken == "") || (pushType == "alert" && device.AlertToken == "")) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("%s token for device %s was not cleared", pushType, deviceID)
+}
+
 func TestV3ResolverAndCrossUserFanoutFirstAnswer(t *testing.T) {
 	fixture := newUserCallFixture(t, nil)
 	resolve := performUserRequest(t, fixture.server, http.MethodPost, "/v3/recipients/resolve", fixture.caller.AccessToken, map[string]string{"recipient": "@" + fixture.targetIOS.User.Username})
@@ -314,8 +343,10 @@ func TestV3PartialAPNSFailurePreservesOtherTargetAndAllFailureTerminates(t *test
 		t.Fatalf("create=%d %q", create.Code, create.Body.String())
 	}
 	waitForPushes(t, fixture.push, 2)
-	response := performUserRequest(t, fixture.server, http.MethodGet, "/v3/calls/"+callID, fixture.caller.AccessToken, nil)
-	view := decodeUserCallView(t, response)
+	view := waitForUserCallView(t, fixture.server, fixture.caller.AccessToken, callID, func(value usercalls.View) bool {
+		return value.State == usercalls.Ringing && value.DeliveryStatus == "submission_accepted"
+	})
+	waitForAccountPushTokenCleared(t, fixture.auth, fixture.targetIOS.Account.AccountID, fixture.targetIOS.DeviceID, "voip")
 	if view.State != usercalls.Ringing || view.DeliveryStatus != "submission_accepted" {
 		t.Fatalf("partial failure killed call: %+v", view)
 	}
@@ -330,8 +361,11 @@ func TestV3PartialAPNSFailurePreservesOtherTargetAndAllFailureTerminates(t *test
 		t.Fatalf("all create=%d %q", created.Code, created.Body.String())
 	}
 	waitForPushes(t, all.push, 2)
-	terminal := performUserRequest(t, all.server, http.MethodGet, "/v3/calls/"+allCallID, all.caller.AccessToken, nil)
-	terminalView := decodeUserCallView(t, terminal)
+	terminalView := waitForUserCallView(t, all.server, all.caller.AccessToken, allCallID, func(value usercalls.View) bool {
+		return value.State == usercalls.Expired && value.TerminalReason == "delivery_failed"
+	})
+	waitForAccountPushTokenCleared(t, all.auth, all.targetIOS.Account.AccountID, all.targetIOS.DeviceID, "voip")
+	waitForAccountPushTokenCleared(t, all.auth, all.targetWatch.Account.AccountID, all.targetWatch.DeviceID, "alert")
 	if terminalView.State != usercalls.Expired || terminalView.TerminalReason != "delivery_failed" {
 		t.Fatalf("all failure=%+v", terminalView)
 	}

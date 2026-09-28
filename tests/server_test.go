@@ -983,11 +983,14 @@ func TestAPNsFailureBecomesAuthoritativeTerminalState(t *testing.T) {
 			if view.TerminalReason != "delivery_failed:Unregistered" || view.DeliveryStatus != "submission_failed:Unregistered" {
 				t.Fatalf("unexpected delivery state: %+v", view)
 			}
-			return
+			device, found := deviceStore.Get("B")
+			if found && device.VoIPToken == "" {
+				return
+			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("APNs failure did not terminate ringing call")
+	t.Fatal("APNs failure did not terminate the call and invalidate the dead token")
 }
 
 func TestMutationIdempotencyRejectsParameterMismatch(t *testing.T) {
