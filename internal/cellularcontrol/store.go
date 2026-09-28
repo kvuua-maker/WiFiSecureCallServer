@@ -242,8 +242,15 @@ func (s *Store) ReceiveWithApplicationState(requestID, mutationID string, target
 	if mutationID == "" || !ValidReceiptContext(context) || !ValidApplicationState(applicationState) {
 		return View{}, failure(400, "invalid_request")
 	}
+	// Silent-background clients through Build51 reuse the request ID as their
+	// receipt mutation ID. Preserve their original first-receipt-wins contract
+	// across later ordinary delivery contexts, while never accepting the
+	// notification-action provenance on a silent request.
+	if value.deliveryMode == SilentBackground && context == ReceiptNotificationAction {
+		return View{}, failure(409, "delivery_mode_mismatch")
+	}
 	if existing, ok := value.receiveMutations[mutationID]; ok {
-		if existing.context != context {
+		if value.deliveryMode == NotificationAction && existing.context != context {
 			return View{}, failure(409, "receipt_mutation_conflict")
 		}
 		return viewLocked(value, boolPointer(false)), nil
@@ -280,9 +287,6 @@ func (s *Store) ReceiveWithApplicationState(requestID, mutationID string, target
 		value.state = IPhoneNotificationActionReceived
 		value.receiveMutations[mutationID] = mutation
 		return viewLocked(value, boolPointer(true)), nil
-	}
-	if context == ReceiptNotificationAction {
-		return View{}, failure(409, "delivery_mode_mismatch")
 	}
 	if value.state != DeliveryPending {
 		value.receiveMutations[mutationID] = mutation

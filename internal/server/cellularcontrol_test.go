@@ -367,6 +367,37 @@ func TestNotificationActionLifecycleRequiresExactActionReceiptBeforeOneTimeStart
 	}
 }
 
+func TestSilentReceiptRouteKeepsBuild51CrossContextIdempotency(t *testing.T) {
+	fixture, _ := prepareRemoteControlFixture(t)
+	controlID := "b5151515-5151-4151-8151-515151515151"
+	created := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls", fixture.targetWatch.AccessToken, map[string]string{
+		"requestID": controlID, "phoneNumber": "+380501234567",
+	})
+	if created.Code != http.StatusOK {
+		t.Fatalf("create status=%d body=%q", created.Code, created.Body.String())
+	}
+	first := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/receive", fixture.targetIOS.AccessToken, map[string]string{
+		"requestID": controlID, "receiptContext": "foreground", "applicationState": "foreground",
+	})
+	firstView := decodeCellularControlView(t, first.Body.Bytes())
+	if first.Code != http.StatusOK || firstView.State != cellularcontrol.IPhoneActionRequired || firstView.ReceiptContext != cellularcontrol.ReceiptForeground {
+		t.Fatalf("first status=%d view=%+v", first.Code, firstView)
+	}
+	duplicate := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/receive", fixture.targetIOS.AccessToken, map[string]string{
+		"requestID": controlID, "receiptContext": "opened_from_notification", "applicationState": "foreground",
+	})
+	duplicateView := decodeCellularControlView(t, duplicate.Body.Bytes())
+	if duplicate.Code != http.StatusOK || duplicateView.MutationApplied == nil || *duplicateView.MutationApplied || duplicateView.State != cellularcontrol.IPhoneActionRequired || duplicateView.ReceiptContext != cellularcontrol.ReceiptForeground {
+		t.Fatalf("duplicate status=%d view=%+v", duplicate.Code, duplicateView)
+	}
+	action := performUserRequest(t, fixture.server, http.MethodPost, "/v3/cellular-controls/"+controlID+"/receive", fixture.targetIOS.AccessToken, map[string]string{
+		"requestID": controlID, "receiptContext": "notification_action", "applicationState": "background",
+	})
+	if action.Code != http.StatusConflict || !strings.Contains(action.Body.String(), "delivery_mode_mismatch") {
+		t.Fatalf("action status=%d body=%q", action.Code, action.Body.String())
+	}
+}
+
 func TestRemoteCellularControlSameOwnerWatchToIPhoneLifecycle(t *testing.T) {
 	fixture, fake := prepareRemoteControlFixture(t)
 	if fixture.targetWatch.Account.AccountID != fixture.targetIOS.Account.AccountID || fixture.targetWatch.User.UserID != fixture.targetIOS.User.UserID {

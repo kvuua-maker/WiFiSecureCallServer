@@ -231,6 +231,55 @@ func TestReceiptContextIsFirstObservedAndValidated(t *testing.T) {
 	}
 }
 
+func TestSilentReceiptMutationPreservesBuild51CrossContextIdempotency(t *testing.T) {
+	tests := []struct {
+		name              string
+		firstContext      ReceiptContext
+		firstAppState     ApplicationState
+		duplicateContext  ReceiptContext
+		duplicateAppState ApplicationState
+		expectedState     State
+	}{
+		{
+			name:         "foreground then opened from notification",
+			firstContext: ReceiptForeground, firstAppState: ApplicationForeground,
+			duplicateContext: ReceiptOpenedFromNotification, duplicateAppState: ApplicationForeground,
+			expectedState: IPhoneActionRequired,
+		},
+		{
+			name:         "background then foreground",
+			firstContext: ReceiptBackground, firstAppState: ApplicationBackground,
+			duplicateContext: ReceiptForeground, duplicateAppState: ApplicationForeground,
+			expectedState: IPhoneBackgroundReceived,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := New(time.Minute)
+			defer store.Close()
+			source, target := participants()
+			id := "51515151-5151-4151-8151-515151515151"
+			if _, _, err := store.Create(id, source, target, testPhone); err != nil {
+				t.Fatal(err)
+			}
+			first, err := store.ReceiveWithApplicationState(id, id, target, test.firstContext, test.firstAppState)
+			if err != nil || first.MutationApplied == nil || !*first.MutationApplied {
+				t.Fatalf("first=%+v err=%v", first, err)
+			}
+			duplicate, err := store.ReceiveWithApplicationState(id, id, target, test.duplicateContext, test.duplicateAppState)
+			if err != nil || duplicate.MutationApplied == nil || *duplicate.MutationApplied {
+				t.Fatalf("duplicate=%+v err=%v", duplicate, err)
+			}
+			if duplicate.State != test.expectedState || duplicate.ReceiptContext != test.firstContext || duplicate.ApplicationState != test.firstAppState || duplicate.ReceivedAt == nil || first.ReceivedAt == nil || !duplicate.ReceivedAt.Equal(*first.ReceivedAt) {
+				t.Fatalf("first receipt was not preserved: first=%+v duplicate=%+v", first, duplicate)
+			}
+			if _, err := store.ReceiveWithApplicationState(id, id, target, ReceiptNotificationAction, ApplicationBackground); errorCode(err) != "delivery_mode_mismatch" {
+				t.Fatalf("silent request accepted action provenance: %v", err)
+			}
+		})
+	}
+}
+
 func TestNotificationActionReceiptDoesNotGetConsumedOrDowngradedByOrdinaryReceipt(t *testing.T) {
 	store := New(time.Minute)
 	defer store.Close()
