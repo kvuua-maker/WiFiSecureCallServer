@@ -18,8 +18,10 @@ import (
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/apns"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/calls"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/cellularcontrol"
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/devicekeys"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/devices"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/media"
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/messages"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/phoneauth"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/usercalls"
 )
@@ -38,6 +40,8 @@ type Server struct {
 	userCalls                 *usercalls.Store
 	accountMedia              *accountmedia.Hub
 	cellularControls          *cellularcontrol.Store
+	deviceKeys                *devicekeys.Store
+	messages                  *messages.Store
 }
 
 func New(tokenA, tokenB string, callStore *calls.Store, deviceStore *devices.Store, push apns.Sender) *Server {
@@ -64,6 +68,8 @@ func NewWithCallStores(tokenA, tokenB string, callStore *calls.Store, deviceStor
 	s := &Server{tokenA: tokenA, tokenB: tokenB, calls: callStore, devices: deviceStore, apns: push, phoneAuth: auth, accountCalls: accountCallStore, userCalls: userCallStore}
 	if auth != nil {
 		s.cellularControls = cellularcontrol.New(cellularcontrol.DefaultTTL)
+		s.deviceKeys = devicekeys.NewMemory()
+		s.messages = messages.NewMemory()
 	}
 	s.media = media.New(callStore)
 	if accountCallStore != nil || userCallStore != nil {
@@ -80,6 +86,14 @@ func NewWithCallStores(tokenA, tokenB string, callStore *calls.Store, deviceStor
 	s.registerV2()
 	s.registerV3()
 	return s
+}
+func (s *Server) ConfigureSecureMessaging(keys *devicekeys.Store, messageStore *messages.Store) {
+	if keys != nil {
+		s.deviceKeys = keys
+	}
+	if messageStore != nil {
+		s.messages = messageStore
+	}
 }
 func (s *Server) Handler() http.Handler { return securityHeaders(s.mux) }
 func (s *Server) Shutdown() {

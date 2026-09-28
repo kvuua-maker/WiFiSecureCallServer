@@ -24,6 +24,14 @@ func (s *Server) registerV3() {
 	s.mux.HandleFunc("POST /v3/cellular-controls/notification-action", s.v2Auth(s.createNotificationActionCellularControl))
 	s.mux.HandleFunc("GET /v3/cellular-controls/{id}", s.v2Auth(s.getCellularControl))
 	s.mux.HandleFunc("POST /v3/cellular-controls/{id}/{action}", s.v2Auth(s.mutateCellularControl))
+	s.mux.HandleFunc("POST /v3/device-keys", s.v2Auth(s.registerDeviceKey))
+	s.mux.HandleFunc("GET /v3/users/{userID}/device-keys", s.v2Auth(s.getDeviceKeys))
+	s.mux.HandleFunc("POST /v3/conversations", s.v2Auth(s.createConversation))
+	s.mux.HandleFunc("GET /v3/conversations", s.v2Auth(s.listConversations))
+	s.mux.HandleFunc("GET /v3/conversations/{conversationID}/messages", s.v2Auth(s.listMessages))
+	s.mux.HandleFunc("POST /v3/conversations/{conversationID}/messages", s.v2Auth(s.sendMessage))
+	s.mux.HandleFunc("POST /v3/conversations/{conversationID}/messages/{messageID}/delivered", s.v2Auth(s.markMessageDelivered))
+	s.mux.HandleFunc("POST /v3/conversations/{conversationID}/messages/{messageID}/read", s.v2Auth(s.markMessageRead))
 }
 
 type appleSignInRequest struct{ RequestID, DeviceID, Platform, IdentityToken, AuthorizationCode, Nonce, DisplayName, Email string }

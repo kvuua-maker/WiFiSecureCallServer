@@ -9,14 +9,14 @@ import (
 )
 
 type Config struct {
-	Address, StatePath, TokenA, TokenB                                        string
-	APNSEnabled                                                               bool
-	APNSTeamID, APNSKeyID, APNSKeyPath                                        string
-	APNSTopicIOS, APNSTopicWatch, APNSTopicIOSVoIP, APNSTopicWatchVoIP        string
-	RingTimeout                                                               time.Duration
-	SMSProvider, SMSClubToken, SMSClubOriginator, AccountStatePath, OTPPepper string
-	SMSMaxSendsPerDay                                                         int
-	AccountAuthEnabled                                                        bool
+	Address, StatePath, TokenA, TokenB                                                                              string
+	APNSEnabled                                                                                                     bool
+	APNSTeamID, APNSKeyID, APNSKeyPath                                                                              string
+	APNSTopicIOS, APNSTopicWatch, APNSTopicIOSVoIP, APNSTopicWatchVoIP                                              string
+	RingTimeout                                                                                                     time.Duration
+	SMSProvider, SMSClubToken, SMSClubOriginator, AccountStatePath, DeviceKeyStatePath, MessageStatePath, OTPPepper string
+	SMSMaxSendsPerDay                                                                                               int
+	AccountAuthEnabled                                                                                              bool
 }
 
 func Load() (Config, error) {
@@ -29,8 +29,10 @@ func Load() (Config, error) {
 		RingTimeout:  30 * time.Second,
 		SMSProvider:  getenv("SMS_PROVIDER", "disabled"),
 		SMSClubToken: os.Getenv("SMSCLUB_TOKEN"), SMSClubOriginator: os.Getenv("SMSCLUB_ORIGINATOR"),
-		AccountStatePath: getenv("WSC_ACCOUNT_STATE_PATH", "/opt/wifi-secure-call/state/accounts.json"),
-		OTPPepper:        os.Getenv("WSC_OTP_PEPPER"),
+		AccountStatePath:   getenv("WSC_ACCOUNT_STATE_PATH", "/opt/wifi-secure-call/state/accounts.json"),
+		DeviceKeyStatePath: getenv("WSC_DEVICE_KEY_STATE_PATH", "/opt/wifi-secure-call/state/device-keys.json"),
+		MessageStatePath:   getenv("WSC_MESSAGE_STATE_PATH", "/opt/wifi-secure-call/state/messages.json"),
+		OTPPepper:          os.Getenv("WSC_OTP_PEPPER"),
 	}
 	if raw := os.Getenv("SMS_MAX_SENDS_PER_DAY"); raw != "" {
 		c.SMSMaxSendsPerDay, _ = strconv.Atoi(raw)

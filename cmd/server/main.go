@@ -15,7 +15,9 @@ import (
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/appleauth"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/calls"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/config"
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/devicekeys"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/devices"
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/messages"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/phoneauth"
 	appserver "github.com/kvuua-maker/wifi-secure-call-server/internal/server"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/smsclub"
@@ -66,7 +68,18 @@ func main() {
 			"com.vkapps.wifisecurecall",
 			"com.vkapps.wifisecurecall.watchkitapp",
 		))
+		deviceKeyStore, keyErr := devicekeys.Open(cfg.DeviceKeyStatePath)
+		if keyErr != nil {
+			slog.Error("device-key state failed", "error", keyErr)
+			os.Exit(1)
+		}
+		messageStore, messageErr := messages.Open(cfg.MessageStatePath)
+		if messageErr != nil {
+			slog.Error("message state failed", "error", messageErr)
+			os.Exit(1)
+		}
 		server = appserver.NewWithV2Calls(cfg.TokenA, cfg.TokenB, callStore, deviceStore, push, auth, accountcalls.New(cfg.RingTimeout))
+		server.ConfigureSecureMessaging(deviceKeyStore, messageStore)
 	}
 	httpServer := &http.Server{Addr: cfg.Address, Handler: server.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 8192}
 	slog.Info("wifi-secure-call listening", "address", cfg.Address, "apnsConfigured", push.Configured())
