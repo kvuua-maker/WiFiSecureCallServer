@@ -36,6 +36,9 @@ type RemoteCellularControlSender interface {
 type RemoteCellularNotificationActionSender interface {
 	RemoteCellularNotificationAction(context.Context, string, string, time.Time, string) (Result, error)
 }
+type SecureMessageSender interface {
+	SecureMessage(context.Context, string, string, string, string, string, time.Time) (Result, error)
+}
 type Result struct {
 	Status                            int
 	Reason, APNSID                    string
@@ -57,6 +60,9 @@ func (Disabled) RemoteCellularControl(context.Context, string, string, time.Time
 	return Result{}, errors.New("APNs disabled")
 }
 func (Disabled) RemoteCellularNotificationAction(context.Context, string, string, time.Time, string) (Result, error) {
+	return Result{}, errors.New("APNs disabled")
+}
+func (Disabled) SecureMessage(context.Context, string, string, string, string, string, time.Time) (Result, error) {
 	return Result{}, errors.New("APNs disabled")
 }
 func (Disabled) Configured() bool { return false }
@@ -156,6 +162,53 @@ func (c *Client) RemoteCellularNotificationAction(ctx context.Context, deviceTok
 		return c.remoteCellularNotificationAction(ctx, deviceToken, requestID, expiresAt, accountID)
 	}
 	return result, err
+}
+
+func (c *Client) SecureMessage(ctx context.Context, platform, deviceToken, conversationID, messageID, accountID string, expiresAt time.Time) (Result, error) {
+	result, err := c.secureMessage(ctx, platform, deviceToken, conversationID, messageID, accountID, expiresAt)
+	if result.Reason == "ExpiredProviderToken" {
+		c.mu.Lock()
+		c.jwt = ""
+		c.jwtAt = time.Time{}
+		c.mu.Unlock()
+		return c.secureMessage(ctx, platform, deviceToken, conversationID, messageID, accountID, expiresAt)
+	}
+	return result, err
+}
+
+func (c *Client) secureMessage(ctx context.Context, platform, deviceToken, conversationID, messageID, accountID string, expiresAt time.Time) (Result, error) {
+	topic := c.topicIOSAlert
+	if platform == "watchOS" {
+		topic = c.topicWatchAlert
+	}
+	body, _ := json.Marshal(map[string]any{
+		"aps":   map[string]any{"alert": map[string]string{"title": "WiFi Secure Call", "body": "New secure message"}, "sound": "default"},
+		"event": "secure_message", "conversationID": conversationID, "messageID": messageID, "accountID": accountID,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.push.apple.com/3/device/"+deviceToken, strings.NewReader(string(body)))
+	if err != nil {
+		return Result{}, err
+	}
+	token, err := c.bearer()
+	if err != nil {
+		return Result{}, err
+	}
+	req.Header.Set("authorization", "bearer "+token)
+	req.Header.Set("apns-topic", topic)
+	req.Header.Set("apns-push-type", "alert")
+	req.Header.Set("apns-priority", "10")
+	req.Header.Set("apns-expiration", fmt.Sprint(expiresAt.Unix()))
+	req.Header.Set("content-type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return Result{}, err
+	}
+	defer resp.Body.Close()
+	result := readResult(resp)
+	if resp.StatusCode/100 != 2 {
+		return result, fmt.Errorf("APNs status %d reason %s", resp.StatusCode, result.Reason)
+	}
+	return result, nil
 }
 
 func (c *Client) remoteCellularNotificationAction(ctx context.Context, deviceToken, requestID string, expiresAt time.Time, accountID string) (Result, error) {
