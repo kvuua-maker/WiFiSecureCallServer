@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"math"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -158,20 +159,116 @@ func TestDeviceKeyAPIRejectsAnotherAuthenticatedDevice(t *testing.T) {
 	}
 }
 
-func TestCrossUserCallsRequireAuthenticatedE2EEPackages(t *testing.T) {
-	fixture := newUserCallFixture(t, nil)
-	callID := "ffffffff-ffff-4fff-8fff-ffffffffffff"
-	missing := performUserRequest(t, fixture.server, http.MethodPost, "/v3/calls", fixture.caller.AccessToken, map[string]string{"requestID": "12121212-1212-4212-8212-121212121212", "callID": callID, "targetUserID": fixture.targetUserID})
-	if missing.Code != http.StatusBadRequest || !strings.Contains(missing.Body.String(), "invalid_key_package") {
-		t.Fatalf("missing=%d %s", missing.Code, missing.Body.String())
+func TestCrossUserCallHTTPPreservesLegacyBuild56AndSecureProtocols(t *testing.T) {
+	legacy := newUserCallFixture(t, nil)
+	legacyCallID := "ffffffff-ffff-4fff-8fff-ffffffffffff"
+	legacyCreate := performUserRequest(t, legacy.server, http.MethodPost, "/v3/calls", legacy.caller.AccessToken, map[string]string{
+		"requestID": "12121212-1212-4212-8212-121212121212", "callID": legacyCallID, "targetUserID": legacy.targetUserID,
+	})
+	if legacyCreate.Code != http.StatusOK {
+		t.Fatalf("legacy create=%d %s", legacyCreate.Code, legacyCreate.Body.String())
 	}
+	legacyCreatedView := decodeUserCallView(t, legacyCreate)
+	if legacyCreatedView.CallerKeyPackage != nil || legacy.server.userCalls.RequiredMediaProtocol(legacyCallID) != 1 {
+		t.Fatalf("legacy create protocol=%d hasPackage=%v", legacy.server.userCalls.RequiredMediaProtocol(legacyCallID), legacyCreatedView.CallerKeyPackage != nil)
+	}
+	legacyAccept := performUserRequest(t, legacy.server, http.MethodPost, "/v3/calls/"+legacyCallID+"/accept", legacy.targetIOS.AccessToken, map[string]string{
+		"requestID": "14141414-1414-4414-8414-141414141414",
+	})
+	if legacyAccept.Code != http.StatusOK {
+		t.Fatalf("legacy accept=%d %s", legacyAccept.Code, legacyAccept.Body.String())
+	}
+	legacyAcceptedView := decodeUserCallView(t, legacyAccept)
+	if legacyAcceptedView.State != usercalls.Accepted || legacyAcceptedView.CalleeKeyPackage != nil || legacyAcceptedView.MediaToken == "" || legacy.server.userCalls.RequiredMediaProtocol(legacyCallID) != 1 {
+		t.Fatalf("legacy accepted state=%s protocol=%d", legacyAcceptedView.State, legacy.server.userCalls.RequiredMediaProtocol(legacyCallID))
+	}
+	legacyWrongMedia := httptest.NewRecorder()
+	legacyWrongMediaRequest := httptest.NewRequest(http.MethodGet, "/v3/media?callID="+legacyCallID+"&side=callee&protocolVersion=2", nil)
+	legacyWrongMediaRequest.Header.Set("Authorization", "Bearer "+legacyAcceptedView.MediaToken)
+	legacy.server.serveMedia(legacyWrongMedia, legacyWrongMediaRequest)
+	if legacyWrongMedia.Code != http.StatusUpgradeRequired {
+		t.Fatalf("legacy media v2 response=%d", legacyWrongMedia.Code)
+	}
+
+	fixture := newUserCallFixture(t, nil)
+	callID := "15151515-1515-4515-8515-151515151515"
 	created := performUserRequest(t, fixture.server, http.MethodPost, "/v3/calls", fixture.caller.AccessToken, fixtureCreateBody(t, fixture, "13131313-1313-4313-8313-131313131313", callID, fixture.targetUserID))
 	if created.Code != http.StatusOK {
 		t.Fatalf("create=%d %s", created.Code, created.Body.String())
 	}
+	if decodeUserCallView(t, created).CallerKeyPackage == nil || fixture.server.userCalls.RequiredMediaProtocol(callID) != 2 {
+		t.Fatalf("secure call did not require protocol 2")
+	}
 	withoutCallee := performUserRequest(t, fixture.server, http.MethodPost, "/v3/calls/"+callID+"/accept", fixture.targetIOS.AccessToken, map[string]string{"requestID": "14141414-1414-4414-8414-141414141414"})
-	if withoutCallee.Code != http.StatusUpgradeRequired || !strings.Contains(withoutCallee.Body.String(), "e2ee_protocol_required") {
+	if withoutCallee.Code != http.StatusConflict || !strings.Contains(withoutCallee.Body.String(), "invalid_key_package") {
 		t.Fatalf("accept=%d %s", withoutCallee.Code, withoutCallee.Body.String())
+	}
+	if fixture.server.userCalls.RequiredMediaProtocol(callID) != 2 {
+		t.Fatal("secure call downgraded after package-free accept")
+	}
+	secureAccept := performUserRequest(t, fixture.server, http.MethodPost, "/v3/calls/"+callID+"/accept", fixture.targetIOS.AccessToken, fixtureAcceptBody(t, fixture, "16161616-1616-4616-8616-161616161616", callID, fixture.targetIOS))
+	if secureAccept.Code != http.StatusOK {
+		t.Fatalf("secure accept=%d %s", secureAccept.Code, secureAccept.Body.String())
+	}
+	secureView := decodeUserCallView(t, secureAccept)
+	if secureView.State != usercalls.Accepted || secureView.CallerKeyPackage == nil || secureView.CalleeKeyPackage == nil || secureView.MediaToken == "" || fixture.server.userCalls.RequiredMediaProtocol(callID) != 2 {
+		t.Fatalf("secure accepted state=%s protocol=%d", secureView.State, fixture.server.userCalls.RequiredMediaProtocol(callID))
+	}
+	secureWrongMedia := httptest.NewRecorder()
+	secureWrongMediaRequest := httptest.NewRequest(http.MethodGet, "/v3/media?callID="+callID+"&side=callee&protocolVersion=1", nil)
+	secureWrongMediaRequest.Header.Set("Authorization", "Bearer "+secureView.MediaToken)
+	fixture.server.serveMedia(secureWrongMedia, secureWrongMediaRequest)
+	if secureWrongMedia.Code != http.StatusUpgradeRequired {
+		t.Fatalf("secure call accepted plaintext media=%d", secureWrongMedia.Code)
+	}
+}
+
+func TestCrossUserCallHTTPRejectsMalformedAndMixedProtocolRequests(t *testing.T) {
+	malformed := newUserCallFixture(t, nil)
+	malformedCallID := "17171717-1717-4717-8717-171717171717"
+	malformedCreate := performUserRequest(t, malformed.server, http.MethodPost, "/v3/calls", malformed.caller.AccessToken, map[string]any{
+		"requestID": "18181818-1818-4818-8818-181818181818", "callID": malformedCallID, "targetUserID": malformed.targetUserID,
+		"callerKeyPackage": map[string]any{},
+	})
+	if malformedCreate.Code != http.StatusBadRequest || !strings.Contains(malformedCreate.Body.String(), "invalid_key_package") || malformed.server.userCalls.RequiredMediaProtocol(malformedCallID) != 0 {
+		t.Fatalf("malformed package fell back: %d %s protocol=%d", malformedCreate.Code, malformedCreate.Body.String(), malformed.server.userCalls.RequiredMediaProtocol(malformedCallID))
+	}
+	nullCreate := performUserRequest(t, malformed.server, http.MethodPost, "/v3/calls", malformed.caller.AccessToken, map[string]any{
+		"requestID": "28282828-2828-4828-8828-282828282828", "callID": malformedCallID, "targetUserID": malformed.targetUserID,
+		"callerKeyPackage": nil,
+	})
+	if nullCreate.Code != http.StatusBadRequest || !strings.Contains(nullCreate.Body.String(), "invalid_key_package") || malformed.server.userCalls.RequiredMediaProtocol(malformedCallID) != 0 {
+		t.Fatalf("null package fell back: %d %s protocol=%d", nullCreate.Code, nullCreate.Body.String(), malformed.server.userCalls.RequiredMediaProtocol(malformedCallID))
+	}
+
+	legacy := newUserCallFixture(t, nil)
+	legacyCallID := "19191919-1919-4919-8919-191919191919"
+	requestID := "20202020-2020-4020-8020-202020202020"
+	legacyCreate := performUserRequest(t, legacy.server, http.MethodPost, "/v3/calls", legacy.caller.AccessToken, map[string]string{
+		"requestID": requestID, "callID": legacyCallID, "targetUserID": legacy.targetUserID,
+	})
+	if legacyCreate.Code != http.StatusOK || legacy.server.userCalls.RequiredMediaProtocol(legacyCallID) != 1 {
+		t.Fatalf("legacy create=%d %s", legacyCreate.Code, legacyCreate.Body.String())
+	}
+	nullAccept := performUserRequest(t, legacy.server, http.MethodPost, "/v3/calls/"+legacyCallID+"/accept", legacy.targetIOS.AccessToken, map[string]any{
+		"requestID": "29292929-2929-4929-8929-292929292929", "calleeKeyPackage": nil,
+	})
+	if nullAccept.Code != http.StatusBadRequest || !strings.Contains(nullAccept.Body.String(), "invalid_key_package") {
+		t.Fatalf("null callee package accepted=%d %s", nullAccept.Code, nullAccept.Body.String())
+	}
+	protocolChange := performUserRequest(t, legacy.server, http.MethodPost, "/v3/calls", legacy.caller.AccessToken, fixtureCreateBody(t, legacy, requestID, legacyCallID, legacy.targetUserID))
+	if protocolChange.Code != http.StatusConflict || legacy.server.userCalls.RequiredMediaProtocol(legacyCallID) != 1 {
+		t.Fatalf("legacy protocol mutation=%d %s protocol=%d", protocolChange.Code, protocolChange.Body.String(), legacy.server.userCalls.RequiredMediaProtocol(legacyCallID))
+	}
+	mixedAccept := performUserRequest(t, legacy.server, http.MethodPost, "/v3/calls/"+legacyCallID+"/accept", legacy.targetIOS.AccessToken, fixtureAcceptBody(t, legacy, "21212121-2121-4121-8121-212121212121", legacyCallID, legacy.targetIOS))
+	if mixedAccept.Code != http.StatusConflict || legacy.server.userCalls.RequiredMediaProtocol(legacyCallID) != 1 {
+		t.Fatalf("legacy accepted secure package=%d %s protocol=%d", mixedAccept.Code, mixedAccept.Body.String(), legacy.server.userCalls.RequiredMediaProtocol(legacyCallID))
+	}
+	legacyAccept := performUserRequest(t, legacy.server, http.MethodPost, "/v3/calls/"+legacyCallID+"/accept", legacy.targetIOS.AccessToken, map[string]string{
+		"requestID": "22222222-2222-4222-8222-222222222222",
+	})
+	if legacyAccept.Code != http.StatusOK || legacy.server.userCalls.RequiredMediaProtocol(legacyCallID) != 1 {
+		t.Fatalf("legacy recovery accept=%d %s", legacyAccept.Code, legacyAccept.Body.String())
 	}
 }
 

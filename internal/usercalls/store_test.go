@@ -96,6 +96,56 @@ func TestFirstAnswerWinsAndMediaIsCallerToWinnerOnly(t *testing.T) {
 	}
 }
 
+func TestLegacyAndSecureProtocolsCannotBeMixedOrDowngraded(t *testing.T) {
+	legacy := New(30 * time.Second)
+	createTwoTargetCall(t, legacy)
+	if got := legacy.RequiredMediaProtocol(testCall); got != 1 {
+		t.Fatalf("legacy protocol=%d", got)
+	}
+	calleePackage := &KeyPackage{
+		ProtocolVersion: 2, KeyEpoch: 1, CallID: testCall, UserID: targetUser,
+		DeviceID: targetDeviceA, Side: SideCallee, EphemeralPublicKey: "callee", Signature: "signature",
+	}
+	if _, _, err := legacy.MutateSecure(testCall, "10101010-1010-4010-8010-101010101010", targetParticipant(targetDeviceA), Accepted, calleePackage); ErrorCode(err) != "idempotency_conflict" {
+		t.Fatalf("legacy accepted secure package: %v", err)
+	}
+	legacyView, applied, err := legacy.Mutate(testCall, "11111111-1111-4111-8111-111111111110", targetParticipant(targetDeviceA), Accepted)
+	if err != nil || !applied || legacyView.State != Accepted || legacyView.CalleeKeyPackage != nil || legacy.RequiredMediaProtocol(testCall) != 1 {
+		t.Fatalf("legacy accept state=%s applied=%v err=%v protocol=%d", legacyView.State, applied, err, legacy.RequiredMediaProtocol(testCall))
+	}
+
+	secure := New(30 * time.Second)
+	callerPackage := KeyPackage{
+		ProtocolVersion: 2, KeyEpoch: 7, CallID: testCall, UserID: callerUser,
+		DeviceID: callerDevice, Side: SideCaller, EphemeralPublicKey: "caller", Signature: "signature",
+	}
+	secureView, _, created, err := secure.CreateSecure(
+		testCall, testRequest, callerParticipant(), targetUser,
+		PublicCaller{Username: "caller.user", DisplayName: "Caller", PublicIdentity: "wsc:user:caller.user"},
+		[]Target{{AccountID: targetAccount, DeviceID: targetDeviceA, Platform: "iOS"}}, callerPackage,
+	)
+	if err != nil || !created || secureView.CallerKeyPackage == nil || secure.RequiredMediaProtocol(testCall) != 2 {
+		t.Fatalf("secure create state=%s created=%v err=%v protocol=%d", secureView.State, created, err, secure.RequiredMediaProtocol(testCall))
+	}
+	if _, _, err = secure.Mutate(testCall, "12121212-1212-4212-8212-121212121212", targetParticipant(targetDeviceA), Accepted); ErrorCode(err) != "invalid_key_package" {
+		t.Fatalf("secure accepted without package: %v", err)
+	}
+	secureCalleePackage := &KeyPackage{
+		ProtocolVersion: 2, KeyEpoch: 7, CallID: testCall, UserID: targetUser,
+		DeviceID: targetDeviceA, Side: SideCallee, EphemeralPublicKey: "callee", Signature: "signature",
+	}
+	secureAccepted, applied, err := secure.MutateSecure(testCall, "13131313-1313-4313-8313-131313131313", targetParticipant(targetDeviceA), Accepted, secureCalleePackage)
+	if err != nil || !applied || secureAccepted.State != Accepted || secureAccepted.CalleeKeyPackage == nil || secure.RequiredMediaProtocol(testCall) != 2 {
+		t.Fatalf("secure accept state=%s applied=%v err=%v protocol=%d", secureAccepted.State, applied, err, secure.RequiredMediaProtocol(testCall))
+	}
+	if _, _, _, err = secure.Create(testCall, testRequest, callerParticipant(), targetUser, PublicCaller{}, []Target{{AccountID: targetAccount, DeviceID: targetDeviceA}}); ErrorCode(err) != "idempotency_conflict" {
+		t.Fatalf("secure call protocol changed by duplicate create: %v", err)
+	}
+	if secure.RequiredMediaProtocol(testCall) != 2 {
+		t.Fatal("secure protocol downgraded after duplicate create")
+	}
+}
+
 func TestConcurrentAcceptChoosesExactlyOneImmutableWinner(t *testing.T) {
 	store := New(30 * time.Second)
 	createTwoTargetCall(t, store)
