@@ -52,6 +52,19 @@ func TestSamePhysicalDeviceIsIsolatedPerUser(t *testing.T) {
 	}
 }
 
+func TestIdempotencyRequestIDIsScopedPerUser(t *testing.T) {
+	store := NewMemory()
+	first, _ := signedRegistration(t, testRequest, testDeviceID, 1)
+	secondUser := "55555555-5555-4555-8555-555555555555"
+	second, _ := signedRegistration(t, testRequest, testDeviceID, 1)
+	if _, created, err := store.Register(testUserID, testDeviceID, first); err != nil || !created {
+		t.Fatalf("first: %v %v", created, err)
+	}
+	if _, created, err := store.Register(secondUser, testDeviceID, second); err != nil || !created {
+		t.Fatalf("second: %v %v", created, err)
+	}
+}
+
 func TestSchemaV1MigratesAtomicallyAndSurvivesRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "keys.json")
 	registration, _ := signedRegistration(t, testRequest, testDeviceID, 1)
@@ -108,8 +121,8 @@ func TestAuthenticatedRegistrationPersistenceIdempotencyAndReplacement(t *testin
 	if _, _, err = reloaded.Register(testUserID, testDeviceID, changed); ErrorCode(err) != "key_changed" {
 		t.Fatalf("changed err=%v", err)
 	}
-	if _, _, err = reloaded.Register("55555555-5555-4555-8555-555555555555", testDeviceID, registration); ErrorCode(err) != "device_not_owned" && ErrorCode(err) != "idempotency_conflict" {
-		t.Fatalf("owner err=%v", err)
+	if _, created, err := reloaded.Register("55555555-5555-4555-8555-555555555555", testDeviceID, registration); err != nil || !created {
+		t.Fatalf("second account registration created=%v err=%v", created, err)
 	}
 }
 

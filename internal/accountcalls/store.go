@@ -40,6 +40,7 @@ type Call struct {
 	TerminalReason, DeliveryStatus     string
 	callerMediaToken, calleeMediaToken string
 	peerEpoch                          map[Side]string
+	lastMediaActivity                  time.Time
 }
 
 type KeyPackage struct {
@@ -299,6 +300,7 @@ func (s *Store) MediaPeerJoined(callID, side, epoch string) bool {
 		return false
 	}
 	call.peerEpoch[value] = epoch
+	call.lastMediaActivity = s.now().UTC()
 	return call.peerEpoch[SideCaller] != "" && call.peerEpoch[SideCallee] != ""
 }
 
@@ -307,6 +309,7 @@ func (s *Store) MediaPeerLeft(callID, side, epoch string) {
 	defer s.mu.Unlock()
 	if call := s.calls[normalize(callID)]; call != nil && call.peerEpoch[Side(side)] == epoch {
 		delete(call.peerEpoch, Side(side))
+		call.lastMediaActivity = s.now().UTC()
 	}
 }
 
@@ -378,6 +381,16 @@ func (s *Store) FailDelivery(callID, reason string) {
 func (s *Store) expireLocked(call *Call) {
 	if call.State == Ringing && !s.now().Before(call.RingExpiresAt) {
 		call.State, call.TerminalAt, call.TerminalReason = Expired, s.now().UTC(), "ring_timeout"
+	}
+	if call.State == Accepted && (call.peerEpoch[SideCaller] == "" || call.peerEpoch[SideCallee] == "") {
+		anchor := call.AcceptedAt
+		if call.lastMediaActivity.After(anchor) {
+			anchor = call.lastMediaActivity
+		}
+		if !anchor.IsZero() && s.now().Sub(anchor) >= 30*time.Second {
+			call.State, call.TerminalAt, call.TerminalReason = Ended, s.now().UTC(), "media_unavailable"
+			call.peerEpoch = map[Side]string{}
+		}
 	}
 }
 

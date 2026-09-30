@@ -90,7 +90,10 @@ func Open(path string) (*Store, error) {
 	}
 	if s.state.SchemaVersion == 1 {
 		migrated := emptyState()
-		migrated.Requests = s.state.Requests
+		for requestID, value := range s.state.Requests {
+			userID := strings.SplitN(value.Parameters, "\x00", 2)[0]
+			migrated.Requests[requestKey(userID, requestID)] = value
+		}
 		for _, value := range s.state.Entries {
 			migrated.Entries[entryKey(value.UserID, value.DeviceID)] = value
 		}
@@ -139,7 +142,8 @@ func (s *Store) Register(userID, authenticatedDeviceID string, input Registratio
 		return Bundle{}, false, failure("invalid_key_proof")
 	}
 	parameters := strings.Join([]string{userID, input.DeviceID, input.SigningPublicKey, input.AgreementPublicKey, strconv.FormatUint(input.KeyVersion, 10), strconv.FormatUint(input.ProtocolVersion, 10)}, "\x00")
-	if prior, ok := s.state.Requests[input.RequestID]; ok {
+	idempotencyKey := requestKey(userID, input.RequestID)
+	if prior, ok := s.state.Requests[idempotencyKey]; ok {
 		if prior.DeviceID != input.DeviceID || prior.Parameters != parameters {
 			return Bundle{}, false, failure("idempotency_conflict")
 		}
@@ -156,7 +160,7 @@ func (s *Store) Register(userID, authenticatedDeviceID string, input Registratio
 		}
 		next := cloneState(s.state)
 		now := s.now().UTC()
-		next.Requests[input.RequestID] = requestRecord{DeviceID: input.DeviceID, Parameters: parameters, CreatedAt: now}
+		next.Requests[idempotencyKey] = requestRecord{DeviceID: input.DeviceID, Parameters: parameters, CreatedAt: now}
 		prune(&next, now)
 		if err = s.persist(next); err != nil {
 			return Bundle{}, false, err
@@ -168,7 +172,7 @@ func (s *Store) Register(userID, authenticatedDeviceID string, input Registratio
 	bundle := Bundle{DeviceID: input.DeviceID, SigningPublicKey: input.SigningPublicKey, AgreementPublicKey: input.AgreementPublicKey, KeyVersion: input.KeyVersion, ProtocolVersion: input.ProtocolVersion, CreatedAt: now, UpdatedAt: now}
 	next := cloneState(s.state)
 	next.Entries[key] = entry{Bundle: bundle, UserID: userID}
-	next.Requests[input.RequestID] = requestRecord{DeviceID: input.DeviceID, Parameters: parameters, CreatedAt: now}
+	next.Requests[idempotencyKey] = requestRecord{DeviceID: input.DeviceID, Parameters: parameters, CreatedAt: now}
 	prune(&next, now)
 	if err = validateState(next); err != nil {
 		return Bundle{}, false, err
@@ -288,6 +292,9 @@ func (s *Store) persist(value state) error {
 func normalize(value string) string { return strings.ToLower(strings.TrimSpace(value)) }
 func entryKey(userID, deviceID string) string {
 	return normalize(userID) + "|" + normalize(deviceID)
+}
+func requestKey(userID, requestID string) string {
+	return normalize(userID) + "|" + normalize(requestID)
 }
 func validUUID(value string) bool {
 	if len(value) != 36 {

@@ -153,12 +153,17 @@ func TestLegacyAndSecureIdempotencyCannotChangeModeOrPackages(t *testing.T) {
 	if _, _, err := legacy.MutateSecure(testCall, "55555555-5555-4555-8555-555555555573", testAccount, testCallee, Accepted, &packageValue); err == nil {
 		t.Fatal("legacy call accepted with secure package")
 	}
-	if legacy.RequiredMediaProtocol(testCall) != 1 { t.Fatal("legacy protocol changed") }
+	if legacy.RequiredMediaProtocol(testCall) != 1 {
+		t.Fatal("legacy protocol changed")
+	}
 
 	secure := New(30 * time.Second)
 	caller := securePackage(SideCaller, testCaller)
-	if _, _, err := secure.CreateSecure(testCall, "55555555-5555-4555-8555-555555555574", testAccount, caller.UserID, testCaller, testCallee, caller); err != nil { t.Fatal(err) }
-	changed := caller; changed.KeyEpoch = 2
+	if _, _, err := secure.CreateSecure(testCall, "55555555-5555-4555-8555-555555555574", testAccount, caller.UserID, testCaller, testCallee, caller); err != nil {
+		t.Fatal(err)
+	}
+	changed := caller
+	changed.KeyEpoch = 2
 	if _, _, err := secure.CreateSecure(testCall, "55555555-5555-4555-8555-555555555574", testAccount, caller.UserID, testCaller, testCallee, changed); err == nil {
 		t.Fatal("idempotent create replaced caller package")
 	}
@@ -188,5 +193,46 @@ func TestRingExpiryDeliveryFailureAndTerminalGC(t *testing.T) {
 	_, _, _ = store.Create("dddddddd-dddd-4ddd-8ddd-dddddddddddd", "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", testAccount, "ffffffff-ffff-4fff-8fff-ffffffffffff", "12121212-1212-4212-8212-121212121212")
 	if _, err := store.Get(testCall, testAccount, testCaller); err == nil {
 		t.Fatal("terminal call not garbage collected")
+	}
+}
+
+func TestAcceptedMediaGraceExpiresOnlyCallsWithoutLivePeers(t *testing.T) {
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	store := New(30 * time.Second)
+	store.SetClock(func() time.Time { return now })
+	createTestCall(t, store)
+	if _, _, err := store.Mutate(testCall, "55555555-5555-4555-8555-555555555599", testAccount, testCallee, Accepted); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(29 * time.Second)
+	if view, err := store.Get(testCall, testAccount, testCaller); err != nil || view.State != Accepted {
+		t.Fatalf("premature expiry: %+v %v", view, err)
+	}
+	store.MediaPeerJoined(testCall, "caller", "caller-1")
+	store.MediaPeerJoined(testCall, "callee", "callee-1")
+	now = now.Add(2 * time.Minute)
+	if view, err := store.Get(testCall, testAccount, testCaller); err != nil || view.State != Accepted {
+		t.Fatalf("live call expired: %+v %v", view, err)
+	}
+	store.MediaPeerLeft(testCall, "caller", "stale-epoch")
+	if view, _ := store.Get(testCall, testAccount, testCaller); view.State != Accepted {
+		t.Fatal("stale epoch removed live peer")
+	}
+	store.MediaPeerLeft(testCall, "caller", "caller-1")
+	now = now.Add(29 * time.Second)
+	if view, _ := store.Get(testCall, testAccount, testCallee); view.State != Accepted {
+		t.Fatal("disconnect grace not honored")
+	}
+	store.MediaPeerJoined(testCall, "caller", "caller-2")
+	now = now.Add(2 * time.Minute)
+	if view, _ := store.Get(testCall, testAccount, testCaller); view.State != Accepted {
+		t.Fatal("rejoined live call expired")
+	}
+	store.MediaPeerLeft(testCall, "caller", "caller-2")
+	store.MediaPeerLeft(testCall, "callee", "callee-1")
+	now = now.Add(30 * time.Second)
+	view, err := store.Get(testCall, testAccount, testCaller)
+	if err != nil || view.State != Ended || view.TerminalReason != "media_unavailable" {
+		t.Fatalf("stale accepted not ended: %+v %v", view, err)
 	}
 }
