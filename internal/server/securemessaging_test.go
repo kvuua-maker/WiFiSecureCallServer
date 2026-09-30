@@ -72,6 +72,48 @@ func TestSecureMessagingAPIEnforcesParticipantsKeysAndReceipts(t *testing.T) {
 	}
 }
 
+func TestConversationListShowsOnlyAuthenticatedParticipantsPeerIdentity(t *testing.T) {
+	fixture := newUserCallFixture(t, nil)
+	created := performUserRequest(t, fixture.server, http.MethodPost, "/v3/conversations", fixture.caller.AccessToken, map[string]string{
+		"requestID": "61616161-6161-4161-8161-616161616161", "targetUserID": fixture.targetUserID,
+	})
+	if created.Code != http.StatusOK {
+		t.Fatalf("create status=%d", created.Code)
+	}
+	type view struct {
+		messages.Conversation
+		Peer struct {
+			UserID, Username, DisplayName, PublicIdentity string
+		} `json:"peer"`
+	}
+	var callerView view
+	if err := json.Unmarshal(created.Body.Bytes(), &callerView); err != nil {
+		t.Fatal(err)
+	}
+	if callerView.Peer.UserID != fixture.targetUserID || callerView.Peer.Username != fixture.targetIOS.User.Username || strings.Contains(created.Body.String(), "phoneNumber") {
+		t.Fatalf("caller peer identity missing or private field exposed")
+	}
+	for _, tc := range []struct {
+		name, token, expectedPeer string
+	}{
+		{"caller", fixture.caller.AccessToken, fixture.targetIOS.User.Username},
+		{"callee", fixture.targetIOS.AccessToken, fixture.caller.User.Username},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			listed := performUserRequest(t, fixture.server, http.MethodGet, "/v3/conversations", tc.token, nil)
+			var rows []view
+			if listed.Code != http.StatusOK || json.Unmarshal(listed.Body.Bytes(), &rows) != nil || len(rows) != 1 || rows[0].Peer.Username != tc.expectedPeer || strings.Contains(listed.Body.String(), "phoneNumber") {
+				t.Fatalf("participant conversation metadata unavailable or private field exposed: status=%d", listed.Code)
+			}
+		})
+	}
+	unrelated := performUserRequest(t, fixture.server, http.MethodGet, "/v3/conversations", fixture.unrelated.AccessToken, nil)
+	var rows []view
+	if unrelated.Code != http.StatusOK || json.Unmarshal(unrelated.Body.Bytes(), &rows) != nil || len(rows) != 0 {
+		t.Fatalf("nonparticipant received conversation metadata: status=%d", unrelated.Code)
+	}
+}
+
 func TestSecureMessagingAPIRejectsInvalidSignatureAndIncompleteEnvelopesWithoutPersistence(t *testing.T) {
 	fixture := newUserCallFixture(t, nil)
 	created := performUserRequest(t, fixture.server, http.MethodPost, "/v3/conversations", fixture.caller.AccessToken, map[string]string{

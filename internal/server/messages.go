@@ -29,6 +29,35 @@ type messageReceiptRequest struct {
 	RequestID string `json:"requestID"`
 }
 
+type conversationPeer struct {
+	UserID         string `json:"userID"`
+	Username       string `json:"username"`
+	DisplayName    string `json:"displayName,omitempty"`
+	PublicIdentity string `json:"publicIdentity"`
+}
+
+type conversationResponse struct {
+	messages.Conversation
+	Peer *conversationPeer `json:"peer,omitempty"`
+}
+
+func (s *Server) conversationForUser(conversation messages.Conversation, userID string) conversationResponse {
+	response := conversationResponse{Conversation: conversation}
+	for _, participant := range conversation.Participants {
+		if strings.EqualFold(participant, userID) {
+			continue
+		}
+		if peer, err := s.phoneAuth.RecipientForUserID(participant); err == nil {
+			response.Peer = &conversationPeer{
+				UserID: peer.UserID, Username: peer.Username,
+				DisplayName: peer.DisplayName, PublicIdentity: peer.PublicIdentity,
+			}
+		}
+		break
+	}
+	return response
+}
+
 func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 	if s.messages == nil {
 		writeError(w, http.StatusServiceUnavailable, "messages_unavailable")
@@ -53,7 +82,7 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 		writeMessageError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, conversation)
+	writeJSON(w, http.StatusOK, s.conversationForUser(conversation, identity.UserID))
 }
 
 func (s *Server) listConversations(w http.ResponseWriter, r *http.Request) {
@@ -61,7 +90,13 @@ func (s *Server) listConversations(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "messages_unavailable")
 		return
 	}
-	writeJSON(w, http.StatusOK, s.messages.Conversations(identityFrom(r.Context()).UserID))
+	userID := identityFrom(r.Context()).UserID
+	conversations := s.messages.Conversations(userID)
+	response := make([]conversationResponse, 0, len(conversations))
+	for _, conversation := range conversations {
+		response = append(response, s.conversationForUser(conversation, userID))
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) listMessages(w http.ResponseWriter, r *http.Request) {
