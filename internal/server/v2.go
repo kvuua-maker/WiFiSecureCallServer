@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/accounts"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/apns"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/phoneauth"
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/usercalls"
 )
 
 type identityKeyType string
@@ -66,8 +68,14 @@ func accountDeviceCallReady(device accounts.Device) bool {
 	return false
 }
 
-type v2CallCreateRequest struct{ RequestID, CallID, TargetDeviceID string }
-type v2CallMutationRequest struct{ RequestID string }
+type v2CallCreateRequest struct {
+	RequestID, CallID, TargetDeviceID string
+	CallerKeyPackage                  json.RawMessage `json:"callerKeyPackage,omitempty"`
+}
+type v2CallMutationRequest struct {
+	RequestID        string
+	CalleeKeyPackage json.RawMessage `json:"calleeKeyPackage,omitempty"`
+}
 
 func (s *Server) v2CreateCall(w http.ResponseWriter, r *http.Request) {
 	if s.accountCalls == nil {
@@ -80,6 +88,17 @@ func (s *Server) v2CreateCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	identity := identityFrom(r.Context())
+	callerPackage, err := parseOptionalUserCallKeyPackage(body.CallerKeyPackage)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_key_package")
+		return
+	}
+	if callerPackage != nil {
+		if err := s.validateUserCallKeyPackage(*callerPackage, body.CallID, identity.UserID, identity.DeviceID, usercalls.SideCaller); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 	target, ok := s.phoneAuth.DeviceForAccount(identity.AccountID, body.TargetDeviceID)
 	if !ok || strings.EqualFold(target.DeviceID, identity.DeviceID) {
 		writeError(w, http.StatusForbidden, "target device unavailable")
@@ -95,7 +114,13 @@ func (s *Server) v2CreateCall(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "device already has an active call")
 		return
 	}
-	view, createdNew, err := s.accountCalls.Create(body.CallID, body.RequestID, identity.AccountID, identity.DeviceID, target.DeviceID)
+	var view accountcalls.View
+	var createdNew bool
+	if callerPackage == nil {
+		view, createdNew, err = s.accountCalls.Create(body.CallID, body.RequestID, identity.AccountID, identity.DeviceID, target.DeviceID)
+	} else {
+		view, createdNew, err = s.accountCalls.CreateSecure(body.CallID, body.RequestID, identity.AccountID, identity.UserID, identity.DeviceID, target.DeviceID, accountCallKeyPackage(*callerPackage))
+	}
 	s.callCreationMu.Unlock()
 	if err != nil {
 		writeError(w, http.StatusConflict, err.Error())
@@ -222,7 +247,27 @@ func (s *Server) v2MutateCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	identity := identityFrom(r.Context())
-	view, _, err := s.accountCalls.Mutate(r.PathValue("id"), body.RequestID, identity.AccountID, identity.DeviceID, target)
+	calleePackage, packageErr := parseOptionalUserCallKeyPackage(body.CalleeKeyPackage)
+	if packageErr != nil {
+		writeError(w, http.StatusBadRequest, "invalid_key_package")
+		return
+	}
+	if target != accountcalls.Accepted && calleePackage != nil {
+		writeError(w, http.StatusBadRequest, "invalid_key_package")
+		return
+	}
+	if calleePackage != nil {
+		if err := s.validateUserCallKeyPackage(*calleePackage, r.PathValue("id"), identity.UserID, identity.DeviceID, usercalls.SideCallee); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	var storedPackage *accountcalls.KeyPackage
+	if calleePackage != nil {
+		value := accountCallKeyPackage(*calleePackage)
+		storedPackage = &value
+	}
+	view, _, err := s.accountCalls.MutateSecure(r.PathValue("id"), body.RequestID, identity.AccountID, identity.DeviceID, target, storedPackage)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			writeError(w, http.StatusRequestTimeout, "cancelled")
@@ -237,6 +282,14 @@ func (s *Server) v2MutateCall(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, view)
+}
+
+func accountCallKeyPackage(value usercalls.KeyPackage) accountcalls.KeyPackage {
+	return accountcalls.KeyPackage{
+		ProtocolVersion: value.ProtocolVersion, KeyEpoch: value.KeyEpoch, CallID: value.CallID,
+		UserID: value.UserID, DeviceID: value.DeviceID, Side: accountcalls.Side(value.Side),
+		EphemeralPublicKey: value.EphemeralPublicKey, Signature: value.Signature,
+	}
 }
 
 type v2DeviceCapabilities struct {

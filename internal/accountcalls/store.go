@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -30,6 +31,9 @@ type Call struct {
 	ID                                 string
 	CallerAccountID, CallerDeviceID    string
 	CalleeAccountID, CalleeDeviceID    string
+	CallerUserID, CalleeUserID         string
+	CallerKeyPackage, CalleeKeyPackage *KeyPackage
+	MediaProtocol                      int
 	State                              State
 	CreatedAt, RingExpiresAt           time.Time
 	AcceptedAt, TerminalAt             time.Time
@@ -38,20 +42,37 @@ type Call struct {
 	peerEpoch                          map[Side]string
 }
 
+type KeyPackage struct {
+	ProtocolVersion    uint64 `json:"protocolVersion"`
+	KeyEpoch           uint64 `json:"keyEpoch"`
+	CallID             string `json:"callID"`
+	UserID             string `json:"userID"`
+	DeviceID           string `json:"deviceID"`
+	Side               Side   `json:"side"`
+	EphemeralPublicKey string `json:"ephemeralPublicKey"`
+	Signature          string `json:"signature"`
+}
+
 type View struct {
-	CallID          string     `json:"callID"`
-	LocalSide       Side       `json:"localSide"`
-	State           State      `json:"state"`
-	ExpiresAt       time.Time  `json:"expiresAt"`
-	MediaToken      string     `json:"mediaToken,omitempty"`
-	RingExpiresAt   time.Time  `json:"ringExpiresAt,omitempty"`
-	AcceptedAt      *time.Time `json:"acceptedAt,omitempty"`
-	TerminalAt      *time.Time `json:"terminalAt,omitempty"`
-	TerminalReason  string     `json:"terminalReason,omitempty"`
-	DeliveryStatus  string     `json:"deliveryStatus,omitempty"`
-	PeerReady       bool       `json:"peerReady,omitempty"`
-	CreatedNew      bool       `json:"createdNew,omitempty"`
-	MutationApplied *bool      `json:"mutationApplied,omitempty"`
+	CallID           string      `json:"callID"`
+	LocalSide        Side        `json:"localSide"`
+	State            State       `json:"state"`
+	ExpiresAt        time.Time   `json:"expiresAt"`
+	MediaToken       string      `json:"mediaToken,omitempty"`
+	RingExpiresAt    time.Time   `json:"ringExpiresAt,omitempty"`
+	AcceptedAt       *time.Time  `json:"acceptedAt,omitempty"`
+	TerminalAt       *time.Time  `json:"terminalAt,omitempty"`
+	TerminalReason   string      `json:"terminalReason,omitempty"`
+	DeliveryStatus   string      `json:"deliveryStatus,omitempty"`
+	PeerReady        bool        `json:"peerReady,omitempty"`
+	CreatedNew       bool        `json:"createdNew,omitempty"`
+	MutationApplied  *bool       `json:"mutationApplied,omitempty"`
+	CallerKeyPackage *KeyPackage `json:"callerKeyPackage,omitempty"`
+	CalleeKeyPackage *KeyPackage `json:"calleeKeyPackage,omitempty"`
+	CallerUserID     string      `json:"callerUserID,omitempty"`
+	CallerDeviceID   string      `json:"callerDeviceID,omitempty"`
+	CalleeUserID     string      `json:"calleeUserID,omitempty"`
+	CalleeDeviceID   string      `json:"calleeDeviceID,omitempty"`
 }
 
 type idempotencyRecord struct {
@@ -79,6 +100,14 @@ func New(ringTimeout time.Duration) *Store {
 func (s *Store) SetClock(now func() time.Time) { s.mu.Lock(); defer s.mu.Unlock(); s.now = now }
 
 func (s *Store) Create(callID, requestID, callerAccountID, callerDeviceID, targetDeviceID string) (View, bool, error) {
+	return s.create(callID, requestID, callerAccountID, "", callerDeviceID, targetDeviceID, nil)
+}
+
+func (s *Store) CreateSecure(callID, requestID, accountID, userID, callerDeviceID, targetDeviceID string, keyPackage KeyPackage) (View, bool, error) {
+	return s.create(callID, requestID, accountID, userID, callerDeviceID, targetDeviceID, &keyPackage)
+}
+
+func (s *Store) create(callID, requestID, callerAccountID, callerUserID, callerDeviceID, targetDeviceID string, callerKeyPackage *KeyPackage) (View, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gcLocked()
@@ -87,7 +116,12 @@ func (s *Store) Create(callID, requestID, callerAccountID, callerDeviceID, targe
 	if callID == "" || requestID == "" || callerAccountID == "" || callerDeviceID == "" || targetDeviceID == "" || callerDeviceID == targetDeviceID {
 		return View{}, false, errors.New("invalid call participants")
 	}
-	parameters := strings.Join([]string{callID, callerAccountID, callerDeviceID, targetDeviceID}, ":")
+	packageParameter := "legacy"
+	if callerKeyPackage != nil {
+		encoded, _ := json.Marshal(callerKeyPackage)
+		packageParameter = string(encoded)
+	}
+	parameters := strings.Join([]string{callID, callerAccountID, callerUserID, callerDeviceID, targetDeviceID, packageParameter}, ":")
 	if prior, ok := s.createRequests[requestID]; ok {
 		if prior.Parameters != parameters {
 			return View{}, false, errors.New("idempotency conflict")
@@ -109,7 +143,11 @@ func (s *Store) Create(callID, requestID, callerAccountID, callerDeviceID, targe
 		}
 	}
 	now := s.now().UTC()
-	call := &Call{ID: callID, CallerAccountID: callerAccountID, CallerDeviceID: callerDeviceID, CalleeAccountID: callerAccountID, CalleeDeviceID: targetDeviceID, State: Ringing, CreatedAt: now, RingExpiresAt: now.Add(s.ringTimeout), peerEpoch: map[Side]string{}}
+	protocol := 1
+	if callerKeyPackage != nil {
+		protocol = 2
+	}
+	call := &Call{ID: callID, CallerAccountID: callerAccountID, CallerDeviceID: callerDeviceID, CalleeAccountID: callerAccountID, CalleeDeviceID: targetDeviceID, CallerUserID: callerUserID, CalleeUserID: callerUserID, CallerKeyPackage: callerKeyPackage, MediaProtocol: protocol, State: Ringing, CreatedAt: now, RingExpiresAt: now.Add(s.ringTimeout), peerEpoch: map[Side]string{}}
 	s.calls[callID] = call
 	view, _ := s.viewLocked(call, callerAccountID, callerDeviceID)
 	view.CreatedNew = true
@@ -129,6 +167,14 @@ func (s *Store) Get(callID, accountID, deviceID string) (View, error) {
 }
 
 func (s *Store) Mutate(callID, requestID, accountID, deviceID string, target State) (View, bool, error) {
+	return s.mutate(callID, requestID, accountID, deviceID, target, nil)
+}
+
+func (s *Store) MutateSecure(callID, requestID, accountID, deviceID string, target State, calleeKeyPackage *KeyPackage) (View, bool, error) {
+	return s.mutate(callID, requestID, accountID, deviceID, target, calleeKeyPackage)
+}
+
+func (s *Store) mutate(callID, requestID, accountID, deviceID string, target State, calleeKeyPackage *KeyPackage) (View, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gcLocked()
@@ -143,7 +189,12 @@ func (s *Store) Mutate(callID, requestID, accountID, deviceID string, target Sta
 		return View{}, false, err
 	}
 	key := strings.Join([]string{callID, accountID, deviceID, requestID}, ":")
-	operation := string(target)
+	packageParameter := "none"
+	if calleeKeyPackage != nil {
+		encoded, _ := json.Marshal(calleeKeyPackage)
+		packageParameter = string(encoded)
+	}
+	operation := string(target) + ":" + packageParameter
 	if prior, ok := s.mutationRequests[key]; ok {
 		if prior.Parameters != operation {
 			return View{}, false, errors.New("idempotency conflict")
@@ -159,6 +210,12 @@ func (s *Store) Mutate(callID, requestID, accountID, deviceID string, target Sta
 	now := s.now().UTC()
 	switch target {
 	case Accepted:
+		if call.MediaProtocol == 2 && calleeKeyPackage == nil {
+			return View{}, false, errors.New("callee key package required")
+		}
+		if call.MediaProtocol == 1 && calleeKeyPackage != nil {
+			return View{}, false, errors.New("key package not allowed for legacy call")
+		}
 		callerToken, err := randomToken()
 		if err != nil {
 			return View{}, false, err
@@ -167,7 +224,7 @@ func (s *Store) Mutate(callID, requestID, accountID, deviceID string, target Sta
 		if err != nil {
 			return View{}, false, err
 		}
-		call.State, call.AcceptedAt = Accepted, now
+		call.State, call.AcceptedAt, call.CalleeKeyPackage = Accepted, now, calleeKeyPackage
 		call.callerMediaToken, call.calleeMediaToken = callerToken, calleeToken
 	case Rejected, Cancelled, Ended:
 		call.State, call.TerminalAt, call.TerminalReason = target, now, string(target)
@@ -262,8 +319,10 @@ func (s *Store) HasCall(callID string) bool {
 }
 
 func (s *Store) RequiredMediaProtocol(callID string) int {
-	if s.HasCall(callID) {
-		return 1
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if call := s.calls[normalize(callID)]; call != nil {
+		return call.MediaProtocol
 	}
 	return 0
 }
@@ -328,6 +387,9 @@ func (s *Store) viewLocked(call *Call, accountID, deviceID string) (View, error)
 		return View{}, err
 	}
 	v := View{CallID: call.ID, LocalSide: side, State: call.State, ExpiresAt: call.RingExpiresAt.UTC().Truncate(time.Second), RingExpiresAt: call.RingExpiresAt.UTC(), TerminalReason: call.TerminalReason, DeliveryStatus: call.DeliveryStatus, PeerReady: call.peerEpoch[SideCaller] != "" && call.peerEpoch[SideCallee] != ""}
+	v.CallerKeyPackage, v.CalleeKeyPackage = call.CallerKeyPackage, call.CalleeKeyPackage
+	v.CallerUserID, v.CalleeUserID = call.CallerUserID, call.CalleeUserID
+	v.CallerDeviceID, v.CalleeDeviceID = call.CallerDeviceID, call.CalleeDeviceID
 	if !call.AcceptedAt.IsZero() {
 		value := call.AcceptedAt.UTC()
 		v.AcceptedAt = &value

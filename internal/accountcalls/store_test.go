@@ -120,6 +120,50 @@ func TestCreateIdempotencyAndOneActiveCallPerDevice(t *testing.T) {
 	}
 }
 
+func securePackage(side Side, device string) KeyPackage {
+	return KeyPackage{ProtocolVersion: 2, KeyEpoch: 1, CallID: testCall,
+		UserID: "99999999-9999-4999-8999-999999999999", DeviceID: device, Side: side,
+		EphemeralPublicKey: "opaque-public", Signature: "opaque-signature"}
+}
+
+func TestSecureAccountCallRequiresBothBoundPackagesAndProtocolTwo(t *testing.T) {
+	store := New(30 * time.Second)
+	callerPackage := securePackage(SideCaller, testCaller)
+	created, fresh, err := store.CreateSecure(testCall, "55555555-5555-4555-8555-555555555570", testAccount, callerPackage.UserID, testCaller, testCallee, callerPackage)
+	if err != nil || !fresh || created.CallerKeyPackage == nil || store.RequiredMediaProtocol(testCall) != 2 {
+		t.Fatalf("secure create=%+v fresh=%v err=%v protocol=%d", created, fresh, err, store.RequiredMediaProtocol(testCall))
+	}
+	if _, _, err = store.Mutate(testCall, "55555555-5555-4555-8555-555555555571", testAccount, testCallee, Accepted); err == nil {
+		t.Fatal("secure call accepted without callee package")
+	}
+	calleePackage := securePackage(SideCallee, testCallee)
+	accepted, applied, err := store.MutateSecure(testCall, "55555555-5555-4555-8555-555555555572", testAccount, testCallee, Accepted, &calleePackage)
+	if err != nil || !applied || accepted.CalleeKeyPackage == nil || accepted.MediaToken == "" {
+		t.Fatalf("secure accept=%+v applied=%v err=%v", accepted, applied, err)
+	}
+	if store.RequiredMediaProtocol(testCall) != 2 {
+		t.Fatal("secure media protocol downgraded")
+	}
+}
+
+func TestLegacyAndSecureIdempotencyCannotChangeModeOrPackages(t *testing.T) {
+	legacy := New(30 * time.Second)
+	createTestCall(t, legacy)
+	packageValue := securePackage(SideCallee, testCallee)
+	if _, _, err := legacy.MutateSecure(testCall, "55555555-5555-4555-8555-555555555573", testAccount, testCallee, Accepted, &packageValue); err == nil {
+		t.Fatal("legacy call accepted with secure package")
+	}
+	if legacy.RequiredMediaProtocol(testCall) != 1 { t.Fatal("legacy protocol changed") }
+
+	secure := New(30 * time.Second)
+	caller := securePackage(SideCaller, testCaller)
+	if _, _, err := secure.CreateSecure(testCall, "55555555-5555-4555-8555-555555555574", testAccount, caller.UserID, testCaller, testCallee, caller); err != nil { t.Fatal(err) }
+	changed := caller; changed.KeyEpoch = 2
+	if _, _, err := secure.CreateSecure(testCall, "55555555-5555-4555-8555-555555555574", testAccount, caller.UserID, testCaller, testCallee, changed); err == nil {
+		t.Fatal("idempotent create replaced caller package")
+	}
+}
+
 func TestRingExpiryDeliveryFailureAndTerminalGC(t *testing.T) {
 	now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
 	store := New(time.Second)
