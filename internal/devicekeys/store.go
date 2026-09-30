@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const SchemaVersion = 1
+const SchemaVersion = 2
 
 type Error struct{ Code string }
 
@@ -88,7 +88,20 @@ func Open(path string) (*Store, error) {
 	if err = json.Unmarshal(data, &s.state); err != nil {
 		return nil, err
 	}
-	if s.state.SchemaVersion != SchemaVersion {
+	if s.state.SchemaVersion == 1 {
+		migrated := emptyState()
+		migrated.Requests = s.state.Requests
+		for _, value := range s.state.Entries {
+			migrated.Entries[entryKey(value.UserID, value.DeviceID)] = value
+		}
+		if err = validateState(migrated); err != nil {
+			return nil, err
+		}
+		if err = s.persist(migrated); err != nil {
+			return nil, err
+		}
+		s.state = migrated
+	} else if s.state.SchemaVersion != SchemaVersion {
 		return nil, errors.New("unsupported device-key schema")
 	}
 	if s.state.Entries == nil {
@@ -130,16 +143,14 @@ func (s *Store) Register(userID, authenticatedDeviceID string, input Registratio
 		if prior.DeviceID != input.DeviceID || prior.Parameters != parameters {
 			return Bundle{}, false, failure("idempotency_conflict")
 		}
-		current, ok := s.state.Entries[input.DeviceID]
+		current, ok := s.state.Entries[entryKey(userID, input.DeviceID)]
 		if !ok {
 			return Bundle{}, false, failure("invalid_device_key")
 		}
 		return current.Bundle, false, nil
 	}
-	if current, ok := s.state.Entries[input.DeviceID]; ok {
-		if current.UserID != userID {
-			return Bundle{}, false, failure("device_not_owned")
-		}
+	key := entryKey(userID, input.DeviceID)
+	if current, ok := s.state.Entries[key]; ok {
 		if current.SigningPublicKey != input.SigningPublicKey || current.AgreementPublicKey != input.AgreementPublicKey || current.KeyVersion != input.KeyVersion || current.ProtocolVersion != input.ProtocolVersion {
 			return Bundle{}, false, failure("key_changed")
 		}
@@ -156,7 +167,7 @@ func (s *Store) Register(userID, authenticatedDeviceID string, input Registratio
 	now := s.now().UTC()
 	bundle := Bundle{DeviceID: input.DeviceID, SigningPublicKey: input.SigningPublicKey, AgreementPublicKey: input.AgreementPublicKey, KeyVersion: input.KeyVersion, ProtocolVersion: input.ProtocolVersion, CreatedAt: now, UpdatedAt: now}
 	next := cloneState(s.state)
-	next.Entries[input.DeviceID] = entry{Bundle: bundle, UserID: userID}
+	next.Entries[key] = entry{Bundle: bundle, UserID: userID}
 	next.Requests[input.RequestID] = requestRecord{DeviceID: input.DeviceID, Parameters: parameters, CreatedAt: now}
 	prune(&next, now)
 	if err = validateState(next); err != nil {
@@ -174,8 +185,8 @@ func (s *Store) ForUser(userID string, activeDeviceIDs map[string]bool) []Bundle
 	defer s.mu.RUnlock()
 	userID = normalize(userID)
 	result := make([]Bundle, 0)
-	for id, value := range s.state.Entries {
-		if value.UserID == userID && (activeDeviceIDs == nil || activeDeviceIDs[id]) {
+	for _, value := range s.state.Entries {
+		if value.UserID == userID && (activeDeviceIDs == nil || activeDeviceIDs[value.DeviceID]) {
 			result = append(result, value.Bundle)
 		}
 	}
@@ -186,8 +197,8 @@ func (s *Store) ForUser(userID string, activeDeviceIDs map[string]bool) []Bundle
 func (s *Store) ForDevice(userID, deviceID string) (Bundle, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	value, ok := s.state.Entries[normalize(deviceID)]
-	return value.Bundle, ok && value.UserID == normalize(userID)
+	value, ok := s.state.Entries[entryKey(userID, deviceID)]
+	return value.Bundle, ok
 }
 
 func ProofMessage(input Registration) []byte {
@@ -223,7 +234,7 @@ func validateState(value state) error {
 		return errors.New("invalid device-key schema")
 	}
 	for id, item := range value.Entries {
-		if id != item.DeviceID || !validUUID(id) || !validUUID(item.UserID) || item.KeyVersion == 0 || item.ProtocolVersion != 2 {
+		if id != entryKey(item.UserID, item.DeviceID) || !validUUID(item.DeviceID) || !validUUID(item.UserID) || item.KeyVersion == 0 || item.ProtocolVersion != 2 {
 			return errors.New("invalid device-key state")
 		}
 		if _, err := decodeFixed(item.SigningPublicKey, 32); err != nil {
@@ -275,6 +286,9 @@ func (s *Store) persist(value state) error {
 	return dir.Sync()
 }
 func normalize(value string) string { return strings.ToLower(strings.TrimSpace(value)) }
+func entryKey(userID, deviceID string) string {
+	return normalize(userID) + "|" + normalize(deviceID)
+}
 func validUUID(value string) bool {
 	if len(value) != 36 {
 		return false

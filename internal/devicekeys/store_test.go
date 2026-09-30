@@ -4,6 +4,8 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -27,6 +29,58 @@ func signedRegistration(t *testing.T, requestID, deviceID string, version uint64
 	value := Registration{RequestID: requestID, DeviceID: deviceID, SigningPublicKey: base64.StdEncoding.EncodeToString(publicKey), AgreementPublicKey: base64.StdEncoding.EncodeToString(agreement), KeyVersion: version, ProtocolVersion: 2}
 	value.ProofSignature = base64.StdEncoding.EncodeToString(ed25519.Sign(privateKey, ProofMessage(value)))
 	return value, privateKey
+}
+
+func TestSamePhysicalDeviceIsIsolatedPerUser(t *testing.T) {
+	store := NewMemory()
+	first, _ := signedRegistration(t, testRequest, testDeviceID, 1)
+	secondUser := "55555555-5555-4555-8555-555555555555"
+	second, _ := signedRegistration(t, "66666666-6666-4666-8666-666666666666", testDeviceID, 1)
+	if _, created, err := store.Register(testUserID, testDeviceID, first); err != nil || !created {
+		t.Fatalf("first created=%v err=%v", created, err)
+	}
+	if _, created, err := store.Register(secondUser, testDeviceID, second); err != nil || !created {
+		t.Fatalf("second created=%v err=%v", created, err)
+	}
+	firstBundle, firstOK := store.ForDevice(testUserID, testDeviceID)
+	secondBundle, secondOK := store.ForDevice(secondUser, testDeviceID)
+	if !firstOK || !secondOK || firstBundle.SigningPublicKey == secondBundle.SigningPublicKey {
+		t.Fatalf("isolated bundles first=%v second=%v", firstOK, secondOK)
+	}
+	if len(store.ForUser(testUserID, nil)) != 1 || len(store.ForUser(secondUser, nil)) != 1 {
+		t.Fatal("user lookup leaked or lost a bundle")
+	}
+}
+
+func TestSchemaV1MigratesAtomicallyAndSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "keys.json")
+	registration, _ := signedRegistration(t, testRequest, testDeviceID, 1)
+	bundle := Bundle{DeviceID: testDeviceID, SigningPublicKey: registration.SigningPublicKey, AgreementPublicKey: registration.AgreementPublicKey, KeyVersion: 1, ProtocolVersion: 2}
+	legacy := state{SchemaVersion: 1, Entries: map[string]entry{testDeviceID: {Bundle: bundle, UserID: testUserID}}, Requests: map[string]requestRecord{}}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := migrated.ForDevice(testUserID, testDeviceID); !ok {
+		t.Fatal("migrated bundle missing")
+	}
+	reloaded, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.state.SchemaVersion != SchemaVersion {
+		t.Fatalf("schema=%d", reloaded.state.SchemaVersion)
+	}
+	if _, ok := reloaded.ForDevice(testUserID, testDeviceID); !ok {
+		t.Fatal("restarted bundle missing")
+	}
 }
 
 func TestAuthenticatedRegistrationPersistenceIdempotencyAndReplacement(t *testing.T) {
