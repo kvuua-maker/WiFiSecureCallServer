@@ -187,3 +187,21 @@ func TestMediaPacketVersionsAreStrictAndOpaque(t *testing.T) {
 		t.Fatal("oversized frame accepted")
 	}
 }
+
+func TestOutboundOverflowKeepsNewestBoundedAudioWithoutClosingPeer(t *testing.T) {
+	p := &peer{outbound: make(chan []byte, 2), done: make(chan struct{})}
+	if !p.enqueueLatest([]byte{1}) || !p.enqueueLatest([]byte{2}) || !p.enqueueLatest([]byte{3}) {
+		t.Fatal("bounded newest-frame enqueue failed")
+	}
+	if got := <-p.outbound; len(got) != 1 || got[0] != 2 {
+		t.Fatalf("oldest frame was not dropped: %v", got)
+	}
+	if got := <-p.outbound; len(got) != 1 || got[0] != 3 {
+		t.Fatalf("newest frame missing: %v", got)
+	}
+	select {
+	case <-p.done:
+		t.Fatal("short overflow closed authenticated peer")
+	default:
+	}
+}

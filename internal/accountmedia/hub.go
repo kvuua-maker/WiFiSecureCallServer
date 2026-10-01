@@ -156,12 +156,10 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		copyData := append([]byte(nil), data...)
-		select {
-		case destination.outbound <- copyData:
+		if destination.enqueueLatest(copyData) {
 			stats.relayedPackets++
-		default:
+		} else {
 			stats.relayFailures++
-			destination.close(websocket.ClosePolicyViolation, "relay overflow")
 		}
 	}
 }
@@ -196,6 +194,30 @@ func (p *peer) close(code int, reason string) {
 		_ = p.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, reason), time.Now().Add(time.Second))
 		_ = p.conn.Close()
 	})
+}
+
+// Live voice prefers the newest bounded frame over queueing stale audio.
+// A short writer stall therefore drops latency, not the authenticated peer.
+func (p *peer) enqueueLatest(data []byte) bool {
+	select {
+	case <-p.done:
+		return false
+	case p.outbound <- data:
+		return true
+	default:
+	}
+	select {
+	case <-p.outbound:
+	default:
+	}
+	select {
+	case <-p.done:
+		return false
+	case p.outbound <- data:
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *Hub) add(p *peer) bool {
@@ -245,11 +267,7 @@ func (h *Hub) sendPeerReady(id string) {
 	}
 	packet := controlPacket(id, 3)
 	for _, p := range []*peer{caller, callee} {
-		select {
-		case p.outbound <- packet:
-		default:
-			p.close(websocket.ClosePolicyViolation, "ready overflow")
-		}
+		_ = p.enqueueLatest(packet)
 	}
 }
 
