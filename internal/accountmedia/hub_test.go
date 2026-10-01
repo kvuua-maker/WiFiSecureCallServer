@@ -189,7 +189,7 @@ func TestMediaPacketVersionsAreStrictAndOpaque(t *testing.T) {
 }
 
 func TestOutboundOverflowKeepsNewestBoundedAudioWithoutClosingPeer(t *testing.T) {
-	p := &peer{outbound: make(chan []byte, 2), done: make(chan struct{})}
+	p := &peer{outbound: make(chan []byte, 2), control: make(chan []byte, 1), done: make(chan struct{})}
 	if !p.enqueueLatest([]byte{1}) || !p.enqueueLatest([]byte{2}) || !p.enqueueLatest([]byte{3}) {
 		t.Fatal("bounded newest-frame enqueue failed")
 	}
@@ -203,5 +203,43 @@ func TestOutboundOverflowKeepsNewestBoundedAudioWithoutClosingPeer(t *testing.T)
 	case <-p.done:
 		t.Fatal("short overflow closed authenticated peer")
 	default:
+	}
+}
+
+func TestPeerReadyHasPriorityOverCongestedAudioForBothPeers(t *testing.T) {
+	h := New(nil)
+	caller := &peer{callID: mediaCall, side: "caller", outbound: make(chan []byte, 2), control: make(chan []byte, 1), done: make(chan struct{})}
+	callee := &peer{callID: mediaCall, side: "callee", outbound: make(chan []byte, 2), control: make(chan []byte, 1), done: make(chan struct{})}
+	h.peers[mediaCall] = map[string]*peer{"caller": caller, "callee": callee}
+	for _, p := range []*peer{caller, callee} {
+		p.enqueueLatest([]byte{1})
+		p.enqueueLatest([]byte{2})
+	}
+	h.sendPeerReady(mediaCall)
+	for _, p := range []*peer{caller, callee} {
+		p.enqueueLatest([]byte{3})
+		select {
+		case ready := <-p.control:
+			if len(ready) != controlPacketSize || ready[1] != 3 {
+				t.Fatalf("invalid ready packet: %v", ready)
+			}
+		default:
+			t.Fatal("peer-ready was lost behind audio")
+		}
+	}
+}
+
+func TestClosedAndReplacedPeerCannotConsumeNewTraffic(t *testing.T) {
+	h := New(nil)
+	old := &peer{callID: mediaCall, side: "caller", epoch: "old", outbound: make(chan []byte, 1), control: make(chan []byte, 1), done: make(chan struct{})}
+	newPeer := &peer{callID: mediaCall, side: "caller", epoch: "new", outbound: make(chan []byte, 1), control: make(chan []byte, 1), done: make(chan struct{})}
+	h.peers[mediaCall] = map[string]*peer{"caller": newPeer}
+	close(old.done)
+	if old.enqueueLatest([]byte{1}) || old.enqueueControl([]byte{2}) {
+		t.Fatal("closed replaced peer accepted traffic")
+	}
+	h.remove(old)
+	if h.peers[mediaCall]["caller"] != newPeer {
+		t.Fatal("removing old peer removed replacement")
 	}
 }

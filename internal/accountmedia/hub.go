@@ -43,6 +43,7 @@ type peer struct {
 	callID, side, epoch string
 	protocolVersion     int
 	outbound            chan []byte
+	control             chan []byte
 	done                chan struct{}
 	closeOnce           sync.Once
 	lastSequence        uint64
@@ -82,7 +83,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	p := &peer{conn: conn, callID: id, side: side, epoch: randomEpoch(), protocolVersion: version, outbound: make(chan []byte, outboundCapacity), done: make(chan struct{})}
+	p := &peer{conn: conn, callID: id, side: side, epoch: randomEpoch(), protocolVersion: version, outbound: make(chan []byte, outboundCapacity), control: make(chan []byte, 4), done: make(chan struct{})}
 	started, paired, stats := time.Now(), h.add(p), connectionStats{}
 	slog.Info("account media joined", "callID", id, "side", side, "epoch", p.epoch, "protocolVersion", version)
 	go h.writer(p)
@@ -168,11 +169,22 @@ func (h *Hub) writer(p *peer) {
 	ticker := time.NewTicker(25 * time.Second)
 	defer ticker.Stop()
 	for {
+		// Control state must never sit behind stale voice frames.
 		select {
+		case data := <-p.control:
+			if !p.write(data) {
+				return
+			}
+			continue
+		default:
+		}
+		select {
+		case data := <-p.control:
+			if !p.write(data) {
+				return
+			}
 		case data := <-p.outbound:
-			_ = p.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			if err := p.conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
-				p.close(websocket.CloseGoingAway, "write failed")
+			if !p.write(data) {
 				return
 			}
 		case <-ticker.C:
@@ -187,6 +199,15 @@ func (h *Hub) writer(p *peer) {
 	}
 }
 
+func (p *peer) write(data []byte) bool {
+	_ = p.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := p.conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
+		p.close(websocket.CloseGoingAway, "write failed")
+		return false
+	}
+	return true
+}
+
 func (p *peer) close(code int, reason string) {
 	p.closeOnce.Do(func() {
 		close(p.done)
@@ -199,6 +220,11 @@ func (p *peer) close(code int, reason string) {
 // Live voice prefers the newest bounded frame over queueing stale audio.
 // A short writer stall therefore drops latency, not the authenticated peer.
 func (p *peer) enqueueLatest(data []byte) bool {
+	select {
+	case <-p.done:
+		return false
+	default:
+	}
 	select {
 	case <-p.done:
 		return false
@@ -217,6 +243,20 @@ func (p *peer) enqueueLatest(data []byte) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func (p *peer) enqueueControl(data []byte) bool {
+	select {
+	case <-p.done:
+		return false
+	default:
+	}
+	select {
+	case <-p.done:
+		return false
+	case p.control <- data:
+		return true
 	}
 }
 
@@ -267,7 +307,7 @@ func (h *Hub) sendPeerReady(id string) {
 	}
 	packet := controlPacket(id, 3)
 	for _, p := range []*peer{caller, callee} {
-		_ = p.enqueueLatest(packet)
+		_ = p.enqueueControl(packet)
 	}
 }
 
