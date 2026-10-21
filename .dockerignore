@@ -1,7 +1,0 @@
-.git
-.gitignore
-bin/
-state/
-secrets/
-*.test
-.DS_Store

@@ -45,22 +45,11 @@ jobs:
       - name: Test with the race detector
         run: go test -race -count=1 ./...
 
-      - name: Build both binaries
+      - name: Build
         run: |
           set -euo pipefail
           go build -trimpath -ldflags='-s -w' -o /tmp/wifi-secure-call-server ./cmd/server
-          go build -trimpath -ldflags='-s -w' -o /tmp/wifi-secure-call-sipgw ./cmd/sipgateway
-          ls -l /tmp/wifi-secure-call-server /tmp/wifi-secure-call-sipgw
-
-  container:
-    name: Build the container image
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    needs: test
-    steps:
-      - uses: actions/checkout@v7
-      - name: Build
-        run: docker build -t wifi-secure-call:ci .
+          ls -l /tmp/wifi-secure-call-server
 
   secrets:
     name: Scan for committed secrets
