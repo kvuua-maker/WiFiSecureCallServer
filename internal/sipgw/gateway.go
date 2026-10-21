@@ -304,6 +304,7 @@ func (g *Gateway) handleRegister(req *sip.Request, tx sip.ServerTransaction) {
 			}
 			contact.Source = req.Source()
 			contact.UserAgent = headerValue(req, "User-Agent")
+			contact.URI = contactURITowardsSource(contact.URI, req.Source())
 			g.reg.Register(auth.Username, contact, ttl, now)
 		}
 		g.counters.registrations.Add(1)
@@ -682,6 +683,50 @@ func (g *Gateway) relayResponse(uasTx sip.ServerTransaction, original *sip.Reque
 
 func (g *Gateway) respond(tx sip.ServerTransaction, req *sip.Request, status int, reason string) {
 	_ = tx.Respond(sip.NewResponseFromRequest(req, status, reason, nil))
+}
+
+// contactURITowardsSource makes a registration reachable from this host.
+//
+// A watch behind a home router registers with its private address, which the VPS
+// cannot dial. The source address of the REGISTER is the only address that is
+// known to work in both directions, so a private or unspecified contact host is
+// replaced by it, together with the source port that a symmetric NAT will keep
+// open. A contact that already carries a public address is left alone.
+func contactURITowardsSource(raw, source string) string {
+	var uri sip.Uri
+	if err := sip.ParseUri(raw, &uri); err != nil {
+		return raw
+	}
+	host, portText, err := net.SplitHostPort(source)
+	if err != nil {
+		return raw
+	}
+	sourceIP := net.ParseIP(host)
+	if sourceIP == nil {
+		return raw
+	}
+	contactIP := net.ParseIP(uri.Host)
+	if uri.Host != "" && contactIP != nil && !isPrivateAddress(contactIP) {
+		return raw
+	}
+	if uri.Host != "" && contactIP == nil {
+		// A host name is left to DNS.
+		return raw
+	}
+	uri.Host = sourceIP.String()
+	if port, err := strconv.Atoi(portText); err == nil {
+		uri.Port = port
+	}
+	return uri.String()
+}
+
+// isPrivateAddress reports whether an address is one the public internet cannot
+// route to, which includes loopback and the unspecified address.
+func isPrivateAddress(ip net.IP) bool {
+	if ip == nil || ip.IsUnspecified() || ip.IsLoopback() || ip.IsPrivate() {
+		return true
+	}
+	return ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
 }
 
 // buildForwardRequest turns an inbound request into the request sent upstream.

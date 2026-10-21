@@ -390,3 +390,25 @@ func inviteMessage(port int, callee string, seq int, authorization string) strin
 		callee, port, seq, callee, seq, seq, port, auth, len(sdp), sdp,
 	)
 }
+
+func TestContactURITowardsSourceRewritesPrivateAddresses(t *testing.T) {
+	cases := []struct {
+		name    string
+		contact string
+		source  string
+		want    string
+	}{
+		{"private host", "sip:watch1@192.168.1.7:5060", "203.0.113.5:62000", "sip:watch1@203.0.113.5:62000"},
+		{"unspecified host", "sip:watch1@0.0.0.0:5060", "203.0.113.5:62000", "sip:watch1@203.0.113.5:62000"},
+		{"loopback host", "sip:watch1@127.0.0.1:5060", "203.0.113.5:62000", "sip:watch1@203.0.113.5:62000"},
+		{"public host is kept", "sip:watch1@198.51.100.9:5070", "203.0.113.5:62000", "sip:watch1@198.51.100.9:5070"},
+		{"host name is kept", "sip:watch1@watch.example.com:5060", "203.0.113.5:62000", "sip:watch1@watch.example.com:5060"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := contactURITowardsSource(tc.contact, tc.source); got != tc.want {
+				t.Fatalf("contact = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
