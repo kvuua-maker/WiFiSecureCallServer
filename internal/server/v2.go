@@ -120,6 +120,13 @@ func (s *Server) v2CreateCall(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("account APNs delivery attempted", "callID", view.CallID, "platform", target.Platform, "pushType", pushType, "tokenLength", len(token))
 	go s.deliverAccountIncoming(view, target, token, pushType, identity.AccountID)
+	// A call aimed at a watch also wakes the iPhone it belongs to. The phone is
+	// where CallKit and PushKit actually run when the wrist is down, and it is the
+	// phone that hands the call to the watch over WatchConnectivity; without this
+	// the watch would have to be awake on its own, which it cannot be.
+	if target.Platform == "watchOS" {
+		go s.wakeCompanionIPhones(view, target, identity.AccountID)
+	}
 	writeJSON(w, http.StatusOK, view)
 }
 
@@ -468,4 +475,57 @@ func sourceIP(r *http.Request) string {
 		return "unknown"
 	}
 	return ip.String()
+}
+
+// companionIPhones selects the iPhones that should be woken for a call addressed
+// to a watch: same account, production, a VoIP token and the capability to use it.
+func companionIPhones(devices []accounts.Device, target accounts.Device) []accounts.Device {
+	var companions []accounts.Device
+	for _, device := range devices {
+		if device.AccountID != target.AccountID || device.DeviceID == target.DeviceID {
+			continue
+		}
+		if device.Platform != "iOS" || device.Environment != "production" {
+			continue
+		}
+		if device.VoIPToken == "" || !device.Capabilities.VoIPPush {
+			continue
+		}
+		companions = append(companions, device)
+	}
+	return companions
+}
+
+// wakeCompanionIPhones sends the same incoming-call push to the iPhones of the
+// account that owns the watch the call was addressed to.
+//
+// Delivery to the watch is unaffected: this is an additional wake-up, not a
+// replacement, so a wrist that is awake still rings on its own. Failures here are
+// logged and ignored, because the call itself is already ringing.
+func (s *Server) wakeCompanionIPhones(view accountcalls.View, target accounts.Device, accountID string) {
+	if target.AccountID == "" || s.phoneAuth == nil {
+		return
+	}
+	sender, ok := s.apns.(apns.AccountSender)
+	if !ok {
+		return
+	}
+	companions := companionIPhones(s.phoneAuth.DevicesForAccount(target.AccountID), target)
+	for _, device := range companions {
+		device := device
+		go func() {
+			deadline := view.RingExpiresAt
+			if deadline.IsZero() || deadline.After(time.Now().Add(8*time.Second)) {
+				deadline = time.Now().Add(8 * time.Second)
+			}
+			ctx, cancel := context.WithDeadline(context.Background(), deadline)
+			defer cancel()
+			result, err := sender.IncomingAccountCall(ctx, device.Platform, device.VoIPToken, view.CallID, "voip", view.RingExpiresAt, accountID)
+			if err != nil {
+				slog.Warn("companion iPhone wake failed", "callID", view.CallID, "deviceID", device.DeviceID, "status", result.Status, "reason", result.Reason)
+				return
+			}
+			slog.Info("companion iPhone woken for a watch call", "callID", view.CallID, "deviceID", device.DeviceID)
+		}()
+	}
 }

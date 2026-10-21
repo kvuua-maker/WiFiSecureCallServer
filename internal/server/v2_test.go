@@ -53,3 +53,44 @@ func TestAccountIncomingPushSelectionPreservesPlatformPreferences(t *testing.T) 
 		t.Fatalf("Watch fallback token=%q kind=%q", token, kind)
 	}
 }
+
+func TestCompanionIPhonesWakesOnlyTheOwnersProductionIPhones(t *testing.T) {
+	watch := accounts.Device{AccountID: "account-1", DeviceID: "watch-1", Platform: "watchOS"}
+	watch.Environment = "production"
+	iphone := accounts.Device{AccountID: "account-1", DeviceID: "phone-1", Platform: "iOS", VoIPToken: strings.Repeat("b", 64)}
+	iphone.Environment = "production"
+	iphone.Capabilities = accounts.DeviceCapabilities{VoIPPush: true}
+
+	otherAccount := iphone
+	otherAccount.AccountID = "account-2"
+	otherAccount.DeviceID = "phone-2"
+
+	noCapability := iphone
+	noCapability.DeviceID = "phone-3"
+	noCapability.Capabilities = accounts.DeviceCapabilities{}
+
+	development := iphone
+	development.DeviceID = "phone-4"
+	development.Environment = "development"
+
+	noToken := iphone
+	noToken.DeviceID = "phone-5"
+	noToken.VoIPToken = ""
+
+	companions := companionIPhones(
+		[]accounts.Device{watch, iphone, otherAccount, noCapability, development, noToken},
+		watch,
+	)
+	if len(companions) != 1 || companions[0].DeviceID != "phone-1" {
+		t.Fatalf("companions = %+v, want only phone-1", companions)
+	}
+}
+
+func TestCompanionIPhonesIgnoresACallAddressedToAnIPhone(t *testing.T) {
+	iphone := accounts.Device{AccountID: "account-1", DeviceID: "phone-1", Platform: "iOS", VoIPToken: strings.Repeat("b", 64)}
+	iphone.Environment = "production"
+	iphone.Capabilities = accounts.DeviceCapabilities{VoIPPush: true}
+	if companions := companionIPhones([]accounts.Device{iphone}, iphone); len(companions) != 0 {
+		t.Fatalf("an iPhone call must not wake itself, got %+v", companions)
+	}
+}
