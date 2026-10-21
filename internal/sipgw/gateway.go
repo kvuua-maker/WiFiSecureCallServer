@@ -271,6 +271,7 @@ func (g *Gateway) handleRegister(req *sip.Request, tx sip.ServerTransaction) {
 	auth := g.auth.Verify(headerValues(req, "Authorization"), req.Method.String(), req.Recipient.String())
 	if !auth.OK {
 		g.counters.registrationFails.Add(1)
+		g.log.Info("registration refused", "reason", auth.Reason, "source", req.Source(), "stale", auth.Stale)
 		res := sip.NewResponseFromRequest(req, sip.StatusUnauthorized, "Unauthorized", nil)
 		res.AppendHeader(sip.NewHeader("WWW-Authenticate", auth.Challenge))
 		_ = tx.Respond(res)
