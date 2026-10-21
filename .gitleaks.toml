@@ -1,0 +1,26 @@
+# gitleaks configuration.
+#
+# The default rules are kept. The allowlist records the findings that were
+# reviewed by hand and confirmed not to be credentials, so a new finding in any
+# other file still fails the scan.
+#
+# Reviewed on 2026-10-21 with gitleaks 8.30.1 over the whole history:
+#
+#   internal/sipgw/*_test.go (commits ec58688 and later, removed from the tree)
+#       the fixed nonce-signing secret the SIP gateway tests used, so a digest
+#       could be recomputed deterministically. It authenticated nothing and the
+#       gateway itself has since been removed; the value survives only in history.
+#       It is a constant in a test file, not a credential from any deployment.
+#
+# A credential anywhere else, including in a test file, is still a finding.
+
+title = "WiFi Secure Call Server"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "The fixed nonce secret used by the removed sipgw tests"
+regexes = [
+  '''0123456789abcdef0123456789abcdef''',
+]
