@@ -67,6 +67,7 @@ type accountPushAttempt struct {
 
 type accountPushRecorder struct {
 	attempts chan accountPushAttempt
+	mu       sync.Mutex
 	result   apns.Result
 	err      error
 }
@@ -75,11 +76,16 @@ func (p *accountPushRecorder) IncomingCall(context.Context, string, string, stri
 	return apns.Result{Status: http.StatusOK, Reason: "Success"}, nil
 }
 func (p *accountPushRecorder) IncomingAccountCall(_ context.Context, platform, token, callID, pushType string, _ time.Time, accountID string) (apns.Result, error) {
-	p.attempts <- accountPushAttempt{platform: platform, token: token, callID: callID, pushType: pushType, accountID: accountID}
+	p.mu.Lock()
 	if p.result.Status == 0 {
 		p.result = apns.Result{Status: http.StatusOK, Reason: "Success"}
 	}
-	return p.result, p.err
+	result, err := p.result, p.err
+	p.mu.Unlock()
+	// Sent outside the lock: the channel is buffered, and holding a lock while
+	// blocking on it would deadlock a test that drains slowly.
+	p.attempts <- accountPushAttempt{platform: platform, token: token, callID: callID, pushType: pushType, accountID: accountID}
+	return result, err
 }
 func (p *accountPushRecorder) Configured() bool { return true }
 
