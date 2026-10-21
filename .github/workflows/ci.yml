@@ -1,0 +1,81 @@
+name: Server build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: server-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Vet, test and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - name: Report toolchain
+        run: go version
+
+      - name: Check formatting
+        run: |
+          set -euo pipefail
+          unformatted=$(gofmt -l . | grep -v '^$' || true)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-ed:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test with the race detector
+        run: go test -race -count=1 ./...
+
+      - name: Build both binaries
+        run: |
+          set -euo pipefail
+          go build -trimpath -ldflags='-s -w' -o /tmp/wifi-secure-call-server ./cmd/server
+          go build -trimpath -ldflags='-s -w' -o /tmp/wifi-secure-call-sipgw ./cmd/sipgateway
+          ls -l /tmp/wifi-secure-call-server /tmp/wifi-secure-call-sipgw
+
+  container:
+    name: Build the container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: test
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build
+        run: docker build -t wifi-secure-call:ci .
+
+  secrets:
+    name: Scan for committed secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          version=$(curl -sSfL https://api.github.com/repos/gitleaks/gitleaks/releases/latest | jq -r .tag_name)
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/${version}/gitleaks_${version#v}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+      - name: Scan the whole history
+        run: gitleaks detect --source . --no-banner --redact=100 --exit-code 1
