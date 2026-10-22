@@ -20,6 +20,7 @@ import (
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/devices"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/media"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/phoneauth"
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/relay"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/usercalls"
 )
 
@@ -35,6 +36,7 @@ type Server struct {
 	accountCalls   *accountcalls.Store
 	userCalls      *usercalls.Store
 	accountMedia   *accountmedia.Hub
+	relay          *relay.Hub
 }
 
 func New(tokenA, tokenB string, callStore *calls.Store, deviceStore *devices.Store, push apns.Sender) *Server {
@@ -63,6 +65,7 @@ func NewWithCallStores(tokenA, tokenB string, callStore *calls.Store, deviceStor
 	if accountCallStore != nil || userCallStore != nil {
 		s.accountMedia = accountmedia.New(combinedCallValidator{account: accountCallStore, user: userCallStore})
 	}
+	s.relay = relay.New(10*time.Minute, 8)
 	s.mux = http.NewServeMux()
 	s.mux.HandleFunc("GET /v1/health", s.health)
 	s.mux.HandleFunc("POST /v1/devices/register", s.auth(s.register))
@@ -73,6 +76,9 @@ func NewWithCallStores(tokenA, tokenB string, callStore *calls.Store, deviceStor
 	s.mux.HandleFunc("/media", s.serveMedia)
 	s.registerV2()
 	s.registerV3()
+	// The relay is the fallback for a dial command WatchConnectivity could not
+	// deliver, so it lives beside the account routes and uses the same identity.
+	s.mux.HandleFunc("GET /v1/relay", s.v2Auth(s.relaySocket))
 	return s
 }
 func (s *Server) Handler() http.Handler { return securityHeaders(s.mux) }
@@ -488,4 +494,15 @@ func buildIdentity() string {
 		return value
 	}
 	return "development"
+}
+
+// relaySocket hands one authenticated connection to the relay hub.
+//
+// role=iphone receives queued dial commands, role=watch submits them. The account
+// comes from the bearer token, never from the query, so a caller cannot address
+// somebody else's queue.
+func (s *Server) relaySocket(w http.ResponseWriter, r *http.Request) {
+	identity := identityFrom(r.Context())
+	role := r.URL.Query().Get("role")
+	relay.ServeWS(s.relay, identity.AccountID, role, w, r, slog.Default())
 }
