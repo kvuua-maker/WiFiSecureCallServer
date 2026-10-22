@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +32,8 @@ func (s *Server) registerV2() {
 	s.mux.HandleFunc("POST /v2/watch-link/status", s.watchLinkStatus)
 	s.mux.HandleFunc("POST /v2/devices/register", s.v2Auth(s.v2RegisterDevice))
 	s.mux.HandleFunc("GET /v2/devices", s.v2Auth(s.v2Devices))
+	s.mux.HandleFunc("POST /v2/diagnostics/log", s.v2Auth(s.diagnosticsLog))
+	s.mux.HandleFunc("GET /v2/diagnostics/read", s.v2Auth(s.diagnosticsRead))
 	s.mux.HandleFunc("POST /v2/calls", s.v2Auth(s.v2CreateCall))
 	s.mux.HandleFunc("GET /v2/calls/{id}", s.v2Auth(s.v2GetCall))
 	s.mux.HandleFunc("POST /v2/calls/{id}/{action}", s.v2Auth(s.v2MutateCall))
@@ -130,6 +133,8 @@ func (s *Server) v2CreateCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.Info("account call created", "callID", view.CallID, "callerAccountID", identity.AccountID, "callerDeviceID", identity.DeviceID, "calleeDeviceID", target.DeviceID)
+	s.recordDiagnostic(target.DeviceID, "SIGNALING", "call_created_on_server", "success",
+		"platform="+target.Platform+" callerLocal="+strconv.FormatBool(target.Platform == "watchOS"), nil)
 	token, pushType := selectAccountIncomingPush(target)
 	if token == "" {
 		s.accountCalls.FailDelivery(view.CallID, "device_token_missing")
@@ -140,6 +145,7 @@ func (s *Server) v2CreateCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.Info("account APNs delivery attempted", "callID", view.CallID, "platform", target.Platform, "pushType", pushType, "tokenLength", len(token))
+	s.recordDiagnostic(target.DeviceID, "SERVER", "apns_send_attempted", "info", "platform="+target.Platform+" pushType="+pushType, nil)
 	go s.deliverAccountIncoming(view, target, token, pushType, identity.AccountID)
 	// A call aimed at a watch also wakes the iPhone it belongs to. The phone is
 	// where CallKit and PushKit actually run when the wrist is down, and it is the
@@ -205,10 +211,16 @@ func (s *Server) deliverAccountIncoming(view accountcalls.View, device accounts.
 			_ = s.phoneAuth.InvalidateAccountDeviceToken(accountID, device.DeviceID, pushType, token, device.InstallationGeneration)
 		}
 		slog.Warn("account APNs submission failed", "callID", view.CallID, "status", result.Status, "reason", result.Reason)
+		s.recordDiagnostic(device.DeviceID, "SERVER", "apns_send_failed", "error",
+			"status="+strconv.Itoa(result.Status)+" pushType="+pushType, errors.New(reason))
 		return
 	}
 	s.accountCalls.SetDelivery(view.CallID, "submission_accepted")
 	slog.Info("account APNs submission accepted", "callID", view.CallID, "status", result.Status, "apnsID", result.APNSID)
+	s.recordDiagnostic(device.DeviceID, "SERVER", "apns_send_success", "success",
+		"status="+strconv.Itoa(result.Status)+" pushType="+pushType, nil)
+	s.recordDiagnostic(device.DeviceID, "SERVER", "apns_response_code", "info",
+		"code="+strconv.Itoa(result.Status), nil)
 }
 
 func (s *Server) v2GetCall(w http.ResponseWriter, r *http.Request) {

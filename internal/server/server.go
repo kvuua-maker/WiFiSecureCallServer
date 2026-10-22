@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/apns"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/calls"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/devices"
+	"github.com/kvuua-maker/wifi-secure-call-server/internal/diagnostics"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/media"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/phoneauth"
 	"github.com/kvuua-maker/wifi-secure-call-server/internal/relay"
@@ -37,6 +39,7 @@ type Server struct {
 	userCalls      *usercalls.Store
 	accountMedia   *accountmedia.Hub
 	relay          *relay.Hub
+	diagnostics    *diagnostics.Store
 }
 
 func New(tokenA, tokenB string, callStore *calls.Store, deviceStore *devices.Store, push apns.Sender) *Server {
@@ -66,6 +69,17 @@ func NewWithCallStores(tokenA, tokenB string, callStore *calls.Store, deviceStor
 		s.accountMedia = accountmedia.New(combinedCallValidator{account: accountCallStore, user: userCallStore})
 	}
 	s.relay = relay.New(10*time.Minute, 8)
+	// Diagnostics must never block the product: if the log directory cannot be
+	// opened, the server runs without them rather than refusing to start.
+	path := os.Getenv("WSC_DIAGNOSTICS_PATH")
+	if path == "" {
+		path = "/var/log/wifisecurecall/diagnostics.json"
+	}
+	if store, err := diagnostics.New(path); err == nil {
+		s.diagnostics = store
+	} else {
+		slog.Warn("diagnostics disabled", "path", path, "error", err)
+	}
 	s.mux = http.NewServeMux()
 	s.mux.HandleFunc("GET /v1/health", s.health)
 	s.mux.HandleFunc("POST /v1/devices/register", s.auth(s.register))
@@ -81,7 +95,45 @@ func NewWithCallStores(tokenA, tokenB string, callStore *calls.Store, deviceStor
 	s.mux.HandleFunc("GET /v1/relay", s.v2Auth(s.relaySocket))
 	return s
 }
-func (s *Server) Handler() http.Handler { return securityHeaders(s.mux) }
+func (s *Server) Handler() http.Handler { return securityHeaders(s.recoverPanics(s.mux)) }
+
+// recoverPanics keeps one broken handler from taking the process down, and leaves
+// a record behind so the failure is visible in the diagnostics feed.
+func (s *Server) recoverPanics(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if value := recover(); value != nil {
+				s.recordDiagnostic("server", "SERVER", "go_routine_panic", "error", r.URL.Path, fmt.Errorf("%v", value))
+				http.Error(w, "internal error", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// recordDiagnostic writes one server-side event. It is best effort and never
+// blocks the caller on a full disk.
+func (s *Server) recordDiagnostic(device, category, step, status, details string, err error) {
+	if s.diagnostics == nil {
+		return
+	}
+	record := diagnostics.Record{
+		Timestamp: time.Now().UTC(),
+		Device:    device,
+		Category:  category,
+		Step:      step,
+		Status:    status,
+		Details:   details,
+	}
+	if err != nil {
+		record.Error = err.Error()
+	}
+	go func() {
+		if writeErr := s.diagnostics.Append([]diagnostics.Record{record}); writeErr != nil {
+			slog.Warn("diagnostics write failed", "error", writeErr)
+		}
+	}()
+}
 func (s *Server) Shutdown() {
 	s.media.CloseAll("server restart")
 	if s.accountMedia != nil {
