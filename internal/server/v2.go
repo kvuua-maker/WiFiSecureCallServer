@@ -53,6 +53,22 @@ func (s *Server) v2Devices(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+// accountDeviceCallAttemptable is the weaker test used when a call is placed: the
+// device must be able to receive a push, but it does not have to look fully ready.
+func accountDeviceCallAttemptable(device accounts.Device) bool {
+	if device.Environment != "production" || !device.Capabilities.MicrophoneReady {
+		return false
+	}
+	switch device.Platform {
+	case "iOS":
+		return device.VoIPToken != ""
+	case "watchOS":
+		return device.AlertToken != ""
+	default:
+		return false
+	}
+}
+
 func accountDeviceCallReady(device accounts.Device) bool {
 	if device.Environment != "production" || !device.Capabilities.MicrophoneReady {
 		return false
@@ -85,8 +101,13 @@ func (s *Server) v2CreateCall(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "target device unavailable")
 		return
 	}
-	if !accountDeviceCallReady(target) {
-		writeError(w, http.StatusConflict, "target device not call-ready")
+	// Readiness decides which device a client prefers when choosing a target. It
+	// must not decide whether a call is attempted at all: a stale capability flag
+	// (token uploaded before notifications were allowed, a rotated push token) used
+	// to make a reachable device look unringable, and the caller saw "calling" and
+	// then nothing. Attempt when a usable token exists and let delivery report.
+	if !accountDeviceCallAttemptable(target) {
+		writeError(w, http.StatusConflict, "target device has no push token")
 		return
 	}
 	s.callCreationMu.Lock()

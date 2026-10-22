@@ -94,3 +94,30 @@ func TestCompanionIPhonesIgnoresACallAddressedToAnIPhone(t *testing.T) {
 		t.Fatalf("an iPhone call must not wake itself, got %+v", companions)
 	}
 }
+
+func TestCallAttemptNeedsOnlyAPushToken(t *testing.T) {
+	watch := accounts.Device{Platform: "watchOS", AlertToken: strings.Repeat("a", 64)}
+	watch.Environment = "production"
+	watch.Capabilities = accounts.DeviceCapabilities{MicrophoneReady: true, AlertPush: true}
+
+	// Notifications were never authorised, so listing must not call it ready…
+	if accountDeviceCallReady(watch) {
+		t.Fatal("a watch without notification authorisation must not be listed as ready")
+	}
+	// …but a call to it must still be attempted, because an alert token exists.
+	if !accountDeviceCallAttemptable(watch) {
+		t.Fatal("a watch with an alert token must be callable")
+	}
+
+	noToken := watch
+	noToken.AlertToken = ""
+	if accountDeviceCallAttemptable(noToken) {
+		t.Fatal("a watch with no token must not be attempted")
+	}
+
+	development := watch
+	development.Environment = "development"
+	if accountDeviceCallAttemptable(development) {
+		t.Fatal("a development device must not be attempted")
+	}
+}
