@@ -32,7 +32,7 @@ func (s *Server) registerV2() {
 	s.mux.HandleFunc("POST /v2/watch-link/status", s.watchLinkStatus)
 	s.mux.HandleFunc("POST /v2/devices/register", s.v2Auth(s.v2RegisterDevice))
 	s.mux.HandleFunc("GET /v2/devices", s.v2Auth(s.v2Devices))
-	s.mux.HandleFunc("POST /v2/diagnostics/log", s.v2Auth(s.diagnosticsLog))
+	s.mux.HandleFunc("POST /v2/diagnostics/log", s.diagnosticsLog)
 	s.mux.HandleFunc("GET /v2/diagnostics/read", s.v2Auth(s.diagnosticsRead))
 	s.mux.HandleFunc("POST /v2/calls", s.v2Auth(s.v2CreateCall))
 	s.mux.HandleFunc("GET /v2/calls/{id}", s.v2Auth(s.v2GetCall))

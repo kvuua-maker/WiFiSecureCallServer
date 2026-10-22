@@ -26,7 +26,6 @@ func (s *Server) diagnosticsLog(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "diagnostics unavailable")
 		return
 	}
-	identity := identityFrom(r.Context())
 	body := http.MaxBytesReader(w, r.Body, 256<<10)
 	var request diagnosticsLogRequest
 	if err := json.NewDecoder(body).Decode(&request); err != nil {
@@ -38,8 +37,17 @@ func (s *Server) diagnosticsLog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	device := strings.TrimSpace(request.Device)
-	if device == "" {
-		device = identity.DeviceID
+	// Pre-sign-in batches carry only the device id. That is deliberate: the launch
+	// sequence is exactly where failures happen, and it happens before a token
+	// exists. The id must look like an installation id, and a device may not post
+	// more than a batch per second.
+	if device == "" || len(device) > 64 {
+		writeError(w, http.StatusBadRequest, "device is required")
+		return
+	}
+	if !s.diagnosticsAllow(device) {
+		writeError(w, http.StatusTooManyRequests, "too many diagnostics batches")
+		return
 	}
 	now := time.Now().UTC()
 	for i := range request.Records {
@@ -78,4 +86,28 @@ func (s *Server) diagnosticsRead(w http.ResponseWriter, r *http.Request) {
 		"summary": diagnostics.Summary(records),
 		"records": records,
 	})
+}
+
+// diagnosticsAllow is a coarse per-device rate limit: one batch per second, with a
+// small burst window. It exists so an unsigned endpoint cannot be used to fill the
+// disk, not to police honest clients.
+func (s *Server) diagnosticsAllow(device string) bool {
+	s.diagnosticsRateMu.Lock()
+	defer s.diagnosticsRateMu.Unlock()
+	now := time.Now()
+	if s.diagnosticsRate == nil {
+		s.diagnosticsRate = map[string]time.Time{}
+	}
+	if last, ok := s.diagnosticsRate[device]; ok && now.Sub(last) < time.Second {
+		return false
+	}
+	s.diagnosticsRate[device] = now
+	if len(s.diagnosticsRate) > 4096 {
+		for key, at := range s.diagnosticsRate {
+			if now.Sub(at) > time.Minute {
+				delete(s.diagnosticsRate, key)
+			}
+		}
+	}
+	return true
 }

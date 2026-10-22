@@ -27,19 +27,21 @@ import (
 )
 
 type Server struct {
-	callCreationMu sync.Mutex
-	tokenA, tokenB string
-	calls          *calls.Store
-	devices        *devices.Store
-	apns           apns.Sender
-	media          *media.Hub
-	mux            *http.ServeMux
-	phoneAuth      *phoneauth.Service
-	accountCalls   *accountcalls.Store
-	userCalls      *usercalls.Store
-	accountMedia   *accountmedia.Hub
-	relay          *relay.Hub
-	diagnostics    *diagnostics.Store
+	callCreationMu    sync.Mutex
+	tokenA, tokenB    string
+	calls             *calls.Store
+	devices           *devices.Store
+	apns              apns.Sender
+	media             *media.Hub
+	mux               *http.ServeMux
+	phoneAuth         *phoneauth.Service
+	accountCalls      *accountcalls.Store
+	userCalls         *usercalls.Store
+	accountMedia      *accountmedia.Hub
+	relay             *relay.Hub
+	diagnostics       *diagnostics.Store
+	diagnosticsRateMu sync.Mutex
+	diagnosticsRate   map[string]time.Time
 }
 
 func New(tokenA, tokenB string, callStore *calls.Store, deviceStore *devices.Store, push apns.Sender) *Server {
